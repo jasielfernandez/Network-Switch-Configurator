@@ -196,9 +196,9 @@ class SwitchConfigurator:
 
     def configure_switch(self, switch: Dict) -> bool:
         """Configure a single switch"""
-        hostname = switch.get('hostname', 'unknown')
-        ip_address = switch.get('ip_address', '')
-        os_type = switch.get('os_type', 'cisco').lower()
+        hostname = switch.get('switchname', 'unknown')
+        ip_address = switch.get('ip address', '')
+        os_type = switch.get('vendor', 'cisco').lower()
 
         print(f"\n{'='*60}")
         print(f"Connecting to {hostname} ({ip_address}) - OS: {os_type}")
@@ -300,7 +300,7 @@ def main():
     for switch in switches:
         success = configurator.configure_switch(switch)
         results.append({
-            'hostname': switch.get('hostname', 'unknown'),
+            'hostname': switch.get('switchname', 'unknown'),
             'success': success
         })
 

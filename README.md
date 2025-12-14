@@ -42,15 +42,16 @@ Network-Switch-Configurator/
 
 CSV file containing switch information with the following columns:
 
-- `hostname`: Switch hostname (for identification and logging)
-- `ip_address`: IP address for SSH connection
-- `os_type`: Operating system type (aruba_cx, arubacx, aruba OR cisco_ios_xe, cisco_xe, cisco, ios_xe, ios)
+- `switchname`: Switch hostname (for identification and logging)
+- `ip address`: IP address for SSH connection
+- `vendor`: Operating system vendor (aruba for Aruba CX, cisco for Cisco IOS XE)
+- `switchesin`: Optional field for switch grouping/categorization
 
 Example:
 ```csv
-hostname,ip_address,os_type
-aruba-switch-01,192.168.1.10,aruba_cx
-cisco-switch-01,192.168.1.20,cisco_ios_xe
+switchname,ip address,vendor,switchesin
+BNAGOSWGSGDN-L2-1,10.127.19.68,aruba,1
+BNAGOSWTS-G-DeltaMezz,10.127.19.198,cisco,1
 ```
 
 ### 2. commands.txt
