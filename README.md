@@ -45,11 +45,11 @@ CSV file containing switch information with the following columns:
 - `switchname`: Switch hostname (for identification and logging)
 - `ip address`: IP address for SSH connection
 - `vendor`: Operating system vendor (aruba for Aruba CX, cisco for Cisco IOS XE)
-- `switchesin`: Optional field for switch grouping/categorization
+- `switchesinstack`: Number indicating switch position in stack
 
 Example:
 ```csv
-switchname,ip address,vendor,switchesin
+switchname,ip address,vendor,switchesinstack
 BNAGOSWGSGDN-L2-1,10.127.19.68,aruba,1
 BNAGOSWTS-G-DeltaMezz,10.127.19.198,cisco,1
 ```

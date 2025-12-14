@@ -1,4 +1,4 @@
-switchname,ip address,vendor,switchesin
+switchname,ip address,vendor,switchesinstack
 BNAGOSWTS-G-DeltaMezz,10.127.19.198,cisco,1
 BNAGOSWTS-U-DeltaIs,10.127.19.212,cisco,5
 BNAGOSWTS-A-B146,10.127.19.158,cisco,1
