@@ -1,0 +1,6 @@
+hostname,ip_address,os_type
+aruba-switch-01,192.168.1.10,aruba_cx
+aruba-switch-02,192.168.1.11,aruba_cx
+cisco-switch-01,192.168.1.20,cisco_ios_xe
+cisco-switch-02,192.168.1.21,cisco_ios_xe
+core-switch,192.168.1.100,cisco_ios_xe

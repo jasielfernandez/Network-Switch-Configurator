@@ -1,0 +1,31 @@
+# Network Switch Configuration Commands
+# Lines starting with # are comments and will be ignored
+# These commands will be executed in order
+
+# Example VLAN configuration
+vlan 100
+name VLAN_100_Data
+exit
+
+vlan 200
+name VLAN_200_Voice
+exit
+
+# Example interface configuration
+interface GigabitEthernet1/0/1
+description Access Port for VLAN 100
+switchport mode access
+switchport access vlan 100
+spanning-tree portfast
+exit
+
+# Example logging configuration
+logging buffered 16384
+logging console informational
+
+# Example SNMP configuration
+snmp-server community public RO
+snmp-server location DataCenter-A
+
+# Save configuration (for supported platforms)
+# write memory

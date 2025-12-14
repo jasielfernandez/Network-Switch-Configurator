@@ -1,0 +1,26 @@
+# Prompt Handling Configuration
+# Format: command_keyword | response
+#
+# Special responses:
+#   RETURN or ENTER - sends carriage return
+#   YES - sends 'yes' followed by enter
+#   NO - sends 'no' followed by enter
+#   Any other text - sends that text followed by enter
+#
+# Lines starting with # are comments
+
+# Common prompts
+reload|YES
+write erase|YES
+delete|YES
+copy running-config|RETURN
+overwrite|YES
+confirm|YES
+
+# Specific command prompts
+crypto key generate|RETURN
+clear|YES
+
+# Example: For commands that need specific input
+# If a command asks for a filename, you can specify it:
+# copy flash|startup-config.cfg
