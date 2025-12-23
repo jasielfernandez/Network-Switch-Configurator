@@ -199,8 +199,7 @@ class SwitchConfigurator:
             'host': ip_address,
             'username': self.username,
             'password': self.password,
-            'timeout': 60,
-            'session_log': f'session_{hostname}.log'
+            'timeout': 60
         }
 
         try:
@@ -215,12 +214,6 @@ class SwitchConfigurator:
                 success, output = self.configure_aruba_cx(connection, self.commands)
             else:
                 success, output = self.configure_cisco_ios_xe(connection, self.commands)
-
-            # Save output to file
-            output_file = f'output_{hostname}_{time.strftime("%Y%m%d_%H%M%S")}.log'
-            with open(output_file, 'w') as f:
-                f.write(output)
-            print(f"[INFO] Full output saved to {output_file}")
 
             # Disconnect
             connection.disconnect()

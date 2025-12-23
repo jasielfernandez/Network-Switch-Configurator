@@ -122,13 +122,6 @@ python3 switch_configurator.py
 4. If confirmed: `configure confirm` and `write memory` save the configuration
 5. If not confirmed: Configuration auto-reverts after 2 minutes
 
-### Output Files
-
-The program generates the following files:
-
-- `session_<hostname>.log`: Detailed SSH session log for each switch
-- `output_<hostname>_<timestamp>.log`: Command output for each switch configuration
-
 ## Example Session
 
 ```
@@ -171,10 +164,8 @@ Connecting to aruba-switch-01 (192.168.1.10) - OS: aruba_cx
 ============================================================
 CONFIGURATION APPLIED
 ============================================================
-The configuration will auto-revert in 2 minutes.
-Do you want to CONFIRM the changes? (yes/no): yes
+[INFO] Auto-confirming configuration changes...
 [SUCCESS] Configuration confirmed and saved!
-[INFO] Full output saved to output_aruba-switch-01_20231214_153045.log
 [INFO] Disconnected from aruba-switch-01
 
 ============================================================
@@ -213,12 +204,8 @@ Completed: 1/1 switches configured successfully
 
 ### Commands Not Executing
 - Check command syntax in `commands.txt`
-- Review session logs in `session_<hostname>.log`
 - Verify OS type is correctly specified in `switch.csv`
-
-### Configuration Reverted
-- This is expected if you don't confirm within 2 minutes
-- Re-run the program and confirm changes when prompted
+- Check SSH connectivity and credentials
 
 ## Security Recommendations
 

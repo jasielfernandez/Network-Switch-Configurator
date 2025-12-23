@@ -23,10 +23,6 @@ wheels/
 .installed.cfg
 *.egg
 
-# Session logs
-session_*.log
-output_*.log
-
 # IDE
 .vscode/
 .idea/
