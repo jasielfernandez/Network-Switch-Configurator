@@ -93,14 +93,14 @@ class SwitchConfigurator:
         return os_mapping.get(os_type.lower(), 'cisco_ios')
 
     def configure_aruba_cx(self, connection, commands: List[str]) -> Tuple[bool, str]:
-        """Configure Aruba CX switch with checkpoint auto rollback"""
+        """Configure Aruba CX switch with checkpoint auto confirm"""
         output = ""
         try:
-            print("[INFO] Setting up checkpoint with 2-minute auto-revert...")
-            # Create checkpoint with auto-revert
-            checkpoint_output = connection.send_command('checkpoint auto 2')
+            print("[INFO] Setting up checkpoint with auto-confirm...")
+            # Create checkpoint with auto-confirm
+            checkpoint_output = connection.send_command('checkpoint auto confirm')
             output += checkpoint_output + "\n"
-            print("[INFO] Checkpoint created - configuration will auto-revert in 2 minutes if not confirmed")
+            print("[INFO] Checkpoint created with auto-confirm enabled")
 
             # Execute commands
             print(f"[INFO] Executing {len(commands)} commands...")
@@ -110,21 +110,15 @@ class SwitchConfigurator:
                 output += cmd_output + "\n"
                 time.sleep(0.5)
 
-            # Ask user to confirm changes
+            # Automatically confirm changes
             print("\n" + "="*60)
             print("CONFIGURATION APPLIED")
             print("="*60)
-            print("The configuration will auto-revert in 2 minutes.")
-            confirm = input("Do you want to CONFIRM the changes? (yes/no): ").strip().lower()
-
-            if confirm == 'yes' or confirm == 'y':
-                confirm_output = connection.send_command('checkpoint confirm')
-                output += confirm_output + "\n"
-                print("[SUCCESS] Configuration confirmed and saved!")
-                return True, output
-            else:
-                print("[INFO] Configuration will auto-revert in ~2 minutes...")
-                return False, output
+            print("[INFO] Auto-confirming configuration changes...")
+            confirm_output = connection.send_command('checkpoint confirm')
+            output += confirm_output + "\n"
+            print("[SUCCESS] Configuration confirmed and saved!")
+            return True, output
 
         except Exception as e:
             print(f"[ERROR] Failed during Aruba CX configuration: {e}")
@@ -152,24 +146,18 @@ class SwitchConfigurator:
             # Exit config mode
             connection.send_command('end')
 
-            # Ask user to confirm changes
+            # Automatically confirm changes
             print("\n" + "="*60)
             print("CONFIGURATION APPLIED")
             print("="*60)
-            print("The configuration will auto-revert in 2 minutes.")
-            confirm = input("Do you want to CONFIRM the changes? (yes/no): ").strip().lower()
-
-            if confirm == 'yes' or confirm == 'y':
-                confirm_output = connection.send_command('configure confirm')
-                output += confirm_output + "\n"
-                # Save configuration
-                save_output = connection.send_command('write memory', expect_string=r'#')
-                output += save_output + "\n"
-                print("[SUCCESS] Configuration confirmed and saved!")
-                return True, output
-            else:
-                print("[INFO] Configuration will auto-revert in ~2 minutes...")
-                return False, output
+            print("[INFO] Auto-confirming configuration changes...")
+            confirm_output = connection.send_command('configure confirm')
+            output += confirm_output + "\n"
+            # Save configuration
+            save_output = connection.send_command('write memory', expect_string=r'#')
+            output += save_output + "\n"
+            print("[SUCCESS] Configuration confirmed and saved!")
+            return True, output
 
         except Exception as e:
             print(f"[ERROR] Failed during Cisco IOS XE configuration: {e}")
