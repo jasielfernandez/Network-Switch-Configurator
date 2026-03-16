@@ -1,0 +1,11 @@
+switchname,ip address,vendor,location,mgmt_vlan,site_id
+SWITCH-CORE-01,192.168.1.1,cisco,Main Data Center,10,DC01
+SWITCH-CORE-02,192.168.1.2,cisco,Main Data Center,10,DC01
+SWITCH-DIST-01,192.168.2.1,cisco,Building A Floor 1,20,BLDG-A
+SWITCH-DIST-02,192.168.2.2,cisco,Building A Floor 2,20,BLDG-A
+SWITCH-ACC-01,192.168.3.1,cisco,Building B Floor 1,30,BLDG-B
+SWITCH-ACC-02,192.168.3.2,cisco,Building B Floor 2,30,BLDG-B
+SWITCH-ACC-03,192.168.3.3,aruba,Building C Floor 1,30,BLDG-C
+SWITCH-ACC-04,192.168.3.4,aruba,Building C Floor 2,30,BLDG-C
+SWITCH-LAB-01,192.168.4.1,cisco,Lab Network,40,LAB
+SWITCH-GUEST-01,192.168.5.1,cisco,Guest Network,50,GUEST

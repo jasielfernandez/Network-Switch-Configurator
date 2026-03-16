@@ -30,7 +30,7 @@ pip install netmiko paramiko
 ```
 Network-Switch-Configurator/
 ├── switch_configurator.py    # Main program
-├── switches.csv                 # List of switches to configure
+├── switches.csv.example       # Example switch inventory (copy to switches.csv)
 ├── commands.txt               # Commands to execute on switches
 ├── prompthandling.txt         # Prompt response configuration
 └── requirements.txt           # Python dependencies
@@ -39,6 +39,12 @@ Network-Switch-Configurator/
 ## Configuration Files
 
 ### 1. switches.csv
+
+**Setup:** Copy `switches.csv.example` to `switches.csv` and edit with your switch information.
+
+```bash
+cp switches.csv.example switches.csv
+```
 
 CSV file containing switch information. Required columns:
 
@@ -51,9 +57,9 @@ You can add any additional columns to store switch-specific data. These values c
 
 Example:
 ```csv
-switchname,ip address,vendor,location,mgmt_vlan
-BNAGOSWGSGDN-L2-1,10.127.19.68,aruba,Garden L2,10
-BNAGOSWTS-G-DeltaMezz,10.127.19.198,cisco,Delta Mezzanine,10
+switchname,ip address,vendor,location,mgmt_vlan,site_id
+SWITCH-CORE-01,192.168.1.1,cisco,Main Data Center,10,DC01
+SWITCH-ACC-03,192.168.3.3,aruba,Building C Floor 1,30,BLDG-C
 ```
 
 ### 2. commands.txt
@@ -101,18 +107,22 @@ overwrite|YES
 
 ### Basic Usage
 
-1. Edit `switches.csv` with your switch information
-2. Edit `commands.txt` with the commands you want to execute
-3. (Optional) Edit `prompthandling.txt` for prompt handling
-4. Run the program:
+1. Copy the example file and edit with your switch information:
+   ```bash
+   cp switches.csv.example switches.csv
+   ```
+2. Edit `switches.csv` with your actual switch information
+3. Edit `commands.txt` with the commands you want to execute
+4. (Optional) Edit `prompthandling.txt` for prompt handling
+5. Run the program:
 
 ```bash
 python3 switch_configurator.py
 ```
 
-5. Enter your SSH credentials when prompted
-6. Review the configuration summary and confirm to proceed
-7. Commands are executed and automatically confirmed on each switch
+6. Enter your SSH credentials when prompted
+7. Review the configuration summary and confirm to proceed
+8. Commands are executed and automatically confirmed on each switch
 
 ### Execution Flow
 

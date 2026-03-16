@@ -34,8 +34,9 @@ wheels/
 .DS_Store
 Thumbs.db
 
-# Sensitive data (customize as needed)
-# Uncomment if you want to exclude actual switch data
-# switches.csv
+# Sensitive data - switch inventory should not be committed
+switches.csv
+
+# Uncomment to exclude configuration files if they contain sensitive data
 # commands.txt
 # prompthandling.txt
