@@ -133,10 +133,54 @@ python3 switch_configurator.py
 4. Changes are saved to the switch
 
 #### For Cisco IOS XE Switches:
-1. Program executes `configure terminal revert timer 2` to enter config mode with rollback protection
-2. Commands are executed with variable substitution
-3. Configuration is automatically confirmed with `configure confirm`
-4. Changes are saved with `write memory`
+1. **Archive check and setup** (automatic if needed):
+   - Checks if archive is configured with `show archive`
+   - If not configured, automatically sets up archive with:
+     ```
+     archive
+       path flash:archive-config
+       maximum 10
+     ```
+   - Saves archive configuration permanently
+2. Program executes `configure terminal revert timer 2` to enter config mode with rollback protection
+3. Commands are executed with variable substitution
+4. Configuration is automatically confirmed with `configure confirm`
+5. Changes are saved with `write memory`
+
+### Prerequisites and Auto-Configuration
+
+#### Cisco IOS XE Archive Feature
+
+The script uses Cisco's configuration rollback feature which requires the archive subsystem. **The script automatically detects and configures archive if needed** - no manual setup required.
+
+**What happens automatically:**
+1. Script checks if archive is configured using `show archive`
+2. If not configured, automatically sets up archive with:
+   ```
+   configure terminal
+   archive
+     path flash:archive-config
+     maximum 10
+   end
+   write memory
+   ```
+3. Saves the archive configuration to startup-config
+
+**If you want to pre-configure archive manually:**
+```
+configure terminal
+archive
+  path flash:archive-config
+  maximum 10
+end
+write memory
+```
+
+**Note:** Archive configuration is persistent and only needs to be set up once per switch. Once configured, subsequent script runs will detect it and skip the setup step.
+
+#### Aruba CX Checkpoint Feature
+
+Aruba CX switches have checkpoint functionality built-in and require no additional configuration. The `checkpoint auto confirm` command works out of the box.
 
 ## Example Session
 
@@ -222,6 +266,38 @@ Completed: 1/1 switches configured successfully
 - Check command syntax in `commands.txt`
 - Verify OS type is correctly specified in `switches.csv`
 - Check SSH connectivity and credentials
+
+### Archive Configuration Issues (Cisco IOS XE)
+
+If you see errors related to archive or revert timer on Cisco switches:
+
+**Symptom:** `% Configuration Revert/Replace feature requires archive feature to be enabled`
+
+**Cause:** Archive was not configured and auto-setup failed.
+
+**Solution:**
+1. The script should auto-configure this, but if it fails, verify:
+   - Switch has sufficient flash space: `show flash:`
+   - Switch IOS version supports rollback feature
+   - User has sufficient privileges to configure archive
+
+2. Manually configure archive if needed:
+   ```
+   configure terminal
+   archive
+     path flash:archive-config
+     maximum 10
+   end
+   write memory
+   ```
+
+3. Verify archive is working:
+   ```
+   show archive
+   ```
+   Should display configured path and maximum files.
+
+**Note:** Archive is automatically configured by the script on first run and persists across reboots.
 
 ## Security Recommendations
 

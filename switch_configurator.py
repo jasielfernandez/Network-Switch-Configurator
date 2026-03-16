@@ -105,6 +105,46 @@ class SwitchConfigurator:
         }
         return os_mapping.get(os_type.lower(), 'cisco_ios')
 
+    def check_archive_configured(self, connection) -> bool:
+        """Check if archive is configured on Cisco device"""
+        try:
+            output = connection.send_command('show archive')
+            # If archive is configured, output will show path
+            if 'flash:' in output.lower() or 'bootflash:' in output.lower():
+                return True
+            return False
+        except Exception:
+            return False
+
+    def setup_archive(self, connection) -> Tuple[bool, str]:
+        """Configure archive on Cisco device if not already set up"""
+        output = ""
+        try:
+            print("[INFO] Configuring archive for rollback support...")
+
+            # Configure archive
+            archive_commands = [
+                'configure terminal',
+                'archive',
+                'path flash:archive-config',
+                'maximum 10',
+                'end'
+            ]
+
+            for cmd in archive_commands:
+                cmd_output = connection.send_command(cmd, expect_string=r'#')
+                output += cmd_output + "\n"
+
+            # Save the archive configuration
+            save_output = connection.send_command('write memory', expect_string=r'#')
+            output += save_output + "\n"
+
+            print("[SUCCESS] Archive configured successfully")
+            return True, output
+        except Exception as e:
+            print(f"[ERROR] Failed to configure archive: {e}")
+            return False, output + f"\nERROR: {str(e)}"
+
     def configure_aruba_cx(self, connection, commands: List[str]) -> Tuple[bool, str]:
         """Configure Aruba CX switch with checkpoint auto confirm"""
         output = ""
@@ -142,10 +182,27 @@ class SwitchConfigurator:
         """Configure Cisco IOS XE switch with configure terminal revert"""
         output = ""
         try:
+            # Check if archive is configured
+            if not self.check_archive_configured(connection):
+                print("[WARN] Archive not configured, setting up now...")
+                success, archive_output = self.setup_archive(connection)
+                output += archive_output + "\n"
+                if not success:
+                    print("[ERROR] Cannot proceed without archive configuration")
+                    return False, output
+            else:
+                print("[INFO] Archive already configured")
+
             print("[INFO] Entering configuration mode with revert timer (2 minutes)...")
             # Enter config mode with revert timer
             revert_output = connection.send_command('configure terminal revert timer 2', expect_string=r'#')
             output += revert_output + "\n"
+
+            # Validate that revert timer was accepted
+            if 'error' in revert_output.lower() or 'invalid' in revert_output.lower():
+                print("[ERROR] Failed to enter revert mode - archive may not be properly configured")
+                return False, output
+
             print("[INFO] Configuration mode entered - will auto-revert in 2 minutes if not confirmed")
 
             # Execute commands
@@ -166,6 +223,7 @@ class SwitchConfigurator:
             print("[INFO] Auto-confirming configuration changes...")
             confirm_output = connection.send_command('configure confirm')
             output += confirm_output + "\n"
+
             # Save configuration
             save_output = connection.send_command('write memory', expect_string=r'#')
             output += save_output + "\n"
