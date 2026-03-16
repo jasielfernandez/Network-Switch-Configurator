@@ -36,6 +36,6 @@ Thumbs.db
 
 # Sensitive data (customize as needed)
 # Uncomment if you want to exclude actual switch data
-# switch.csv
+# switches.csv
 # commands.txt
 # prompthandling.txt

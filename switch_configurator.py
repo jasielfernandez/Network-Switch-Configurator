@@ -8,8 +8,7 @@ import csv
 import getpass
 import sys
 import time
-from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Tuple
 from netmiko import ConnectHandler, NetmikoTimeoutException, NetmikoAuthenticationException
 
 
@@ -25,10 +24,23 @@ class SwitchConfigurator:
     def load_switches(self, csv_file: str) -> List[Dict]:
         """Load switch information from CSV file"""
         switches = []
+        required_columns = {'switchname', 'ip address', 'vendor'}
         try:
             with open(csv_file, 'r') as f:
                 reader = csv.DictReader(f)
+                # Validate required columns exist
+                if reader.fieldnames:
+                    missing = required_columns - set(reader.fieldnames)
+                    if missing:
+                        print(f"[ERROR] Missing required columns in {csv_file}: {', '.join(missing)}")
+                        sys.exit(1)
+
                 for row in reader:
+                    # Validate required fields have values
+                    for col in required_columns:
+                        if not row.get(col, '').strip():
+                            print(f"[ERROR] Empty value for required column '{col}' in row: {row}")
+                            sys.exit(1)
                     switches.append(row)
             print(f"[INFO] Loaded {len(switches)} switches from {csv_file}")
             return switches
@@ -61,6 +73,7 @@ class SwitchConfigurator:
                     if line.strip() and not line.startswith('#'):
                         if '|' in line:
                             prompt, response = line.strip().split('|', 1)
+                            response = response.strip()
                             # Handle special keywords
                             if response.upper() == 'RETURN' or response.upper() == 'ENTER':
                                 response = '\n'
@@ -68,7 +81,7 @@ class SwitchConfigurator:
                                 response = 'yes\n'
                             elif response.upper() == 'NO':
                                 response = 'no\n'
-                            self.prompt_handlers[prompt.strip()] = response.strip()
+                            self.prompt_handlers[prompt.strip()] = response
             print(f"[INFO] Loaded {len(self.prompt_handlers)} prompt handlers from {prompt_file}")
             return self.prompt_handlers
         except FileNotFoundError:
@@ -164,6 +177,21 @@ class SwitchConfigurator:
             print("[INFO] Configuration will auto-revert if active...")
             return False, output + f"\nERROR: {str(e)}"
 
+    def substitute_variables(self, commands: List[str], switch: Dict) -> List[str]:
+        """Substitute variables in commands with values from switch CSV row"""
+        substituted = []
+        for cmd in commands:
+            try:
+                # Use format_map for safe variable substitution
+                # This allows {column_name} syntax in commands
+                substituted_cmd = cmd.format_map(switch)
+                substituted.append(substituted_cmd)
+            except KeyError as e:
+                # If a variable is missing, keep the command as-is and warn
+                print(f"[WARN] Variable {e} not found in CSV for command: {cmd}")
+                substituted.append(cmd)
+        return substituted
+
     def execute_command_with_prompts(self, connection, command: str) -> str:
         """Execute command and handle any prompts based on prompt_handlers"""
         try:
@@ -208,12 +236,15 @@ class SwitchConfigurator:
             connection = ConnectHandler(**device)
             print(f"[SUCCESS] Connected to {hostname}")
 
+            # Substitute variables in commands with switch-specific values
+            switch_commands = self.substitute_variables(self.commands, switch)
+
             # Determine OS and configure accordingly
             success = False
             if 'aruba' in os_type:
-                success, output = self.configure_aruba_cx(connection, self.commands)
+                success, output = self.configure_aruba_cx(connection, switch_commands)
             else:
-                success, output = self.configure_cisco_ios_xe(connection, self.commands)
+                success, output = self.configure_cisco_ios_xe(connection, switch_commands)
 
             # Disconnect
             connection.disconnect()
@@ -242,14 +273,21 @@ def main():
     # Get credentials
     print("\nPlease enter SSH credentials:")
     username = input("Username: ").strip()
+    if not username:
+        print("[ERROR] Username cannot be empty")
+        sys.exit(1)
+
     password = getpass.getpass("Password: ")
+    if not password:
+        print("[ERROR] Password cannot be empty")
+        sys.exit(1)
 
     # Initialize configurator
     configurator = SwitchConfigurator(username, password)
 
     # Load files
     print("\nLoading configuration files...")
-    switches = configurator.load_switches('switch.csv')
+    switches = configurator.load_switches('switches.csv')
     commands = configurator.load_commands('commands.txt')
     configurator.load_prompt_handlers('prompthandling.txt')
 

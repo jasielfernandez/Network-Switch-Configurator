@@ -30,7 +30,7 @@ pip install netmiko paramiko
 ```
 Network-Switch-Configurator/
 ├── switch_configurator.py    # Main program
-├── switch.csv                 # List of switches to configure
+├── switches.csv                 # List of switches to configure
 ├── commands.txt               # Commands to execute on switches
 ├── prompthandling.txt         # Prompt response configuration
 └── requirements.txt           # Python dependencies
@@ -38,37 +38,46 @@ Network-Switch-Configurator/
 
 ## Configuration Files
 
-### 1. switch.csv
+### 1. switches.csv
 
-CSV file containing switch information with the following columns:
+CSV file containing switch information. Required columns:
 
 - `switchname`: Switch hostname (for identification and logging)
 - `ip address`: IP address for SSH connection
 - `vendor`: Operating system vendor (aruba for Aruba CX, cisco for Cisco IOS XE)
 
+**Additional Columns (Optional):**
+You can add any additional columns to store switch-specific data. These values can be used as variables in your commands using `{column_name}` syntax.
+
 Example:
 ```csv
-switchname,ip address,vendor
-BNAGOSWGSGDN-L2-1,10.127.19.68,aruba
-BNAGOSWTS-G-DeltaMezz,10.127.19.198,cisco
+switchname,ip address,vendor,location,mgmt_vlan
+BNAGOSWGSGDN-L2-1,10.127.19.68,aruba,Garden L2,10
+BNAGOSWTS-G-DeltaMezz,10.127.19.198,cisco,Delta Mezzanine,10
 ```
 
 ### 2. commands.txt
 
 Text file with commands to execute, one per line. Lines starting with `#` are treated as comments.
 
+**Variable Substitution:**
+Use `{column_name}` to insert values from the CSV file. Variables are replaced with switch-specific values from switches.csv.
+
 Example:
 ```
-# VLAN Configuration
-vlan 100
-name VLAN_100_Data
+# VLAN Configuration using variables
+vlan {mgmt_vlan}
+name Management_VLAN
 exit
 
-# Interface Configuration
+# Interface Configuration with location variable
 interface GigabitEthernet1/0/1
-description Access Port
+description Access Port at {location}
 switchport mode access
 exit
+
+# SNMP location from CSV
+snmp-server location {location}
 ```
 
 ### 3. prompthandling.txt
@@ -92,7 +101,7 @@ overwrite|YES
 
 ### Basic Usage
 
-1. Edit `switch.csv` with your switch information
+1. Edit `switches.csv` with your switch information
 2. Edit `commands.txt` with the commands you want to execute
 3. (Optional) Edit `prompthandling.txt` for prompt handling
 4. Run the program:
@@ -103,23 +112,21 @@ python3 switch_configurator.py
 
 5. Enter your SSH credentials when prompted
 6. Review the configuration summary and confirm to proceed
-7. After commands are executed, you have 2 minutes to confirm or the changes will auto-revert
+7. Commands are executed and automatically confirmed on each switch
 
 ### Execution Flow
 
 #### For Aruba CX Switches:
-1. Program executes `checkpoint auto 2` to create a checkpoint with 2-minute auto-revert
-2. Commands are executed
-3. User is prompted to confirm changes
-4. If confirmed: `checkpoint confirm` saves the configuration
-5. If not confirmed: Configuration auto-reverts after 2 minutes
+1. Program executes `checkpoint auto confirm` to enable auto-confirmation
+2. Commands are executed with variable substitution
+3. Configuration is automatically confirmed with `checkpoint confirm`
+4. Changes are saved to the switch
 
 #### For Cisco IOS XE Switches:
-1. Program executes `configure terminal revert timer 2` to enter config mode with revert timer
-2. Commands are executed
-3. User is prompted to confirm changes
-4. If confirmed: `configure confirm` and `write memory` save the configuration
-5. If not confirmed: Configuration auto-reverts after 2 minutes
+1. Program executes `configure terminal revert timer 2` to enter config mode with rollback protection
+2. Commands are executed with variable substitution
+3. Configuration is automatically confirmed with `configure confirm`
+4. Changes are saved with `write memory`
 
 ## Example Session
 
@@ -134,7 +141,7 @@ Username: admin
 Password: ********
 
 Loading configuration files...
-[INFO] Loaded 2 switches from switch.csv
+[INFO] Loaded 2 switches from switches.csv
 [INFO] Loaded 5 commands from commands.txt
 [INFO] Loaded 3 prompt handlers from prompthandling.txt
 
@@ -192,7 +199,7 @@ Completed: 1/1 switches configured successfully
 ## Troubleshooting
 
 ### Connection Timeout
-- Verify IP addresses in `switch.csv`
+- Verify IP addresses in `switches.csv`
 - Ensure switches are reachable (try `ping <ip_address>`)
 - Check firewall rules for SSH (port 22)
 
@@ -203,13 +210,13 @@ Completed: 1/1 switches configured successfully
 
 ### Commands Not Executing
 - Check command syntax in `commands.txt`
-- Verify OS type is correctly specified in `switch.csv`
+- Verify OS type is correctly specified in `switches.csv`
 - Check SSH connectivity and credentials
 
 ## Security Recommendations
 
 1. Use read-only credentials for testing
-2. Keep `switch.csv` secure (contains IP addresses)
+2. Keep `switches.csv` secure (contains IP addresses)
 3. Review all commands in `commands.txt` before execution
 4. Test on non-production switches first
 5. Always verify configuration changes before confirming

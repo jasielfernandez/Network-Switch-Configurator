@@ -1,0 +1,25 @@
+switchname,ip address,vendor,location,mgmt_vlan
+BNAGOSWTS-G-DeltaMezz,10.127.19.198,cisco,Delta Mezzanine,10
+BNAGOSWTS-U-DeltaIs,10.127.19.212,cisco,Delta Island,10
+BNAGOSWTS-A-B146,10.127.19.158,cisco,Building 146,10
+BNAGOSWTS-C-RymB1,10.127.19.194,cisco,Ryman B1,10
+BNAGOSWTS-D-RymB3,10.127.19.195,cisco,Ryman B3,10
+BNAGOSWTS-E-RymB5,10.127.19.196,cisco,Ryman B5,10
+BNAGOSWTS-F-RymC2,10.127.19.197,cisco,Ryman C2,10
+BNAGOSWTS-H-Davidson,10.127.19.200,cisco,Davidson,10
+BNAGOSWTS-I-RymC1,10.127.19.201,cisco,Ryman C1,10
+BNAGOSWTS-J-RymC2,10.127.19.203,cisco,Ryman C2,10
+BNAGOSWTS-K-IDFCloset,10.127.19.204,cisco,IDF Closet,10
+BNAGOSWTS-L-CIDD,10.127.19.205,cisco,CIDD,10
+BNAGOSWTS-O-PresLobby,10.127.19.206,cisco,Presidents Lobby,10
+BNAGOSWTS-P-MagMezz,10.127.19.207,cisco,Mag Mezzanine,10
+BNAGOSWTS-V-Jackson,10.127.19.213,cisco,Jackson,10
+BNAGOSWTS-W-MagMezz,10.127.19.214,cisco,Mag Mezzanine,10
+BNAGOSWTS-B-RymMeet,10.127.19.159,cisco,Ryman Meeting,10
+BNAGOSWTS-S-TennBall,10.127.19.209,cisco,Tennessee Ballroom,10
+BNAGOSWTS-T-DeltaBas,10.127.19.211,cisco,Delta Basement,10
+BNAGOSWTS-X-DeltaMezz,10.127.19.215,cisco,Delta Mezzanine,10
+BNAGOSWTS-Z-EventCtr,10.127.19.217,cisco,Event Center,10
+BNAGOSWADSSCGround,10.127.19.48,cisco,ADSS Ground,10
+BNAGOSWGSGDN-L2-1,10.127.19.68,aruba,Garden L2,10
+BNAGOSWGSGDN-L3-3,10.127.19.72,aruba,Garden L3,10

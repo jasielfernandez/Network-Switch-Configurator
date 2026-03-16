@@ -1,21 +1,26 @@
 # Network Switch Configuration Commands
 # Lines starting with # are comments and will be ignored
 # These commands will be executed in order
+#
+# VARIABLE SUBSTITUTION:
+# Use {column_name} to insert values from the CSV file
+# Example: {switchname}, {location}, {mgmt_vlan}, etc.
+# Variables are substituted per switch from the switches.csv columns
 
-# Example VLAN configuration
-vlan 100
-name VLAN_100_Data
-exit
+# Example using variables from CSV
+snmp-server location {location}
+snmp-server contact Network Team
 
-vlan 200
-name VLAN_200_Voice
+# Example VLAN configuration using mgmt_vlan variable
+vlan {mgmt_vlan}
+name Management_VLAN
 exit
 
 # Example interface configuration
 interface GigabitEthernet1/0/1
-description Access Port for VLAN 100
+description Access Port at {location}
 switchport mode access
-switchport access vlan 100
+switchport access vlan {mgmt_vlan}
 spanning-tree portfast
 exit
 
@@ -23,9 +28,5 @@ exit
 logging buffered 16384
 logging console informational
 
-# Example SNMP configuration
-snmp-server community public RO
-snmp-server location DataCenter-A
-
-# Save configuration (for supported platforms)
-# write memory
+# Hostname configuration example (optional)
+# hostname {switchname}
