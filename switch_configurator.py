@@ -10,6 +10,16 @@ import sys
 import time
 from typing import List, Dict, Tuple
 from netmiko import ConnectHandler, NetmikoTimeoutException, NetmikoAuthenticationException
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.prompt import Prompt, Confirm
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.style import Style
+from rich import box
+
+# Initialize rich console
+console = Console()
 
 
 class SwitchConfigurator:
@@ -32,23 +42,23 @@ class SwitchConfigurator:
                 if reader.fieldnames:
                     missing = required_columns - set(reader.fieldnames)
                     if missing:
-                        print(f"[ERROR] Missing required columns in {csv_file}: {', '.join(missing)}")
+                        console.print(f"[bold red]✗ ERROR:[/bold red] Missing required columns in {csv_file}: {', '.join(missing)}")
                         sys.exit(1)
 
                 for row in reader:
                     # Validate required fields have values
                     for col in required_columns:
                         if not row.get(col, '').strip():
-                            print(f"[ERROR] Empty value for required column '{col}' in row: {row}")
+                            console.print(f"[bold red]✗ ERROR:[/bold red] Empty value for required column '{col}' in row: {row}")
                             sys.exit(1)
                     switches.append(row)
-            print(f"[INFO] Loaded {len(switches)} switches from {csv_file}")
+            console.print(f"[bold green]✓ INFO:[/bold green] Loaded {len(switches)} switches from {csv_file}")
             return switches
         except FileNotFoundError:
-            print(f"[ERROR] File not found: {csv_file}")
+            console.print(f"[bold red]✗ ERROR:[/bold red] File not found: {csv_file}")
             sys.exit(1)
         except Exception as e:
-            print(f"[ERROR] Failed to load switches: {e}")
+            console.print(f"[bold red]✗ ERROR:[/bold red] Failed to load switches: {e}")
             sys.exit(1)
 
     def load_commands(self, commands_file: str) -> List[str]:
@@ -56,13 +66,13 @@ class SwitchConfigurator:
         try:
             with open(commands_file, 'r') as f:
                 self.commands = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-            print(f"[INFO] Loaded {len(self.commands)} commands from {commands_file}")
+            console.print(f"[bold green]✓ INFO:[/bold green] Loaded {len(self.commands)} commands from {commands_file}")
             return self.commands
         except FileNotFoundError:
-            print(f"[ERROR] File not found: {commands_file}")
+            console.print(f"[bold red]✗ ERROR:[/bold red] File not found: {commands_file}")
             sys.exit(1)
         except Exception as e:
-            print(f"[ERROR] Failed to load commands: {e}")
+            console.print(f"[bold red]✗ ERROR:[/bold red] Failed to load commands: {e}")
             sys.exit(1)
 
     def load_prompt_handlers(self, prompt_file: str) -> Dict[str, str]:
@@ -82,13 +92,13 @@ class SwitchConfigurator:
                             elif response.upper() == 'NO':
                                 response = 'no\n'
                             self.prompt_handlers[prompt.strip()] = response
-            print(f"[INFO] Loaded {len(self.prompt_handlers)} prompt handlers from {prompt_file}")
+            console.print(f"[bold green]✓ INFO:[/bold green] Loaded {len(self.prompt_handlers)} prompt handlers from {prompt_file}")
             return self.prompt_handlers
         except FileNotFoundError:
-            print(f"[WARN] Prompt handling file not found: {prompt_file}, continuing without prompt handlers")
+            console.print(f"[bold yellow]⚠ WARNING:[/bold yellow] Prompt handling file not found: {prompt_file}, continuing without prompt handlers")
             return {}
         except Exception as e:
-            print(f"[WARN] Failed to load prompt handlers: {e}, continuing without them")
+            console.print(f"[bold yellow]⚠ WARNING:[/bold yellow] Failed to load prompt handlers: {e}, continuing without them")
             return {}
 
     def get_device_type(self, os_type: str) -> str:
@@ -120,7 +130,7 @@ class SwitchConfigurator:
         """Configure archive on Cisco device if not already set up"""
         output = ""
         try:
-            print("[INFO] Configuring archive for rollback support...")
+            console.print("[bold cyan]⚙ INFO:[/bold cyan] Configuring archive for rollback support...")
 
             # Configure archive
             archive_commands = [
@@ -139,43 +149,45 @@ class SwitchConfigurator:
             save_output = connection.send_command('write memory', expect_string=r'#')
             output += save_output + "\n"
 
-            print("[SUCCESS] Archive configured successfully")
+            console.print("[bold green]✓ SUCCESS:[/bold green] Archive configured successfully")
             return True, output
         except Exception as e:
-            print(f"[ERROR] Failed to configure archive: {e}")
+            console.print(f"[bold red]✗ ERROR:[/bold red] Failed to configure archive: {e}")
             return False, output + f"\nERROR: {str(e)}"
 
     def configure_aruba_cx(self, connection, commands: List[str]) -> Tuple[bool, str]:
         """Configure Aruba CX switch with checkpoint auto confirm"""
         output = ""
         try:
-            print("[INFO] Setting up checkpoint with auto-confirm...")
+            console.print("[bold cyan]⚙ INFO:[/bold cyan] Setting up checkpoint with auto-confirm...")
             # Create checkpoint with auto-confirm
             checkpoint_output = connection.send_command('checkpoint auto confirm')
             output += checkpoint_output + "\n"
-            print("[INFO] Checkpoint created with auto-confirm enabled")
+            console.print("[bold cyan]⚙ INFO:[/bold cyan] Checkpoint created with auto-confirm enabled")
 
             # Execute commands
-            print(f"[INFO] Executing {len(commands)} commands...")
+            console.print(f"[bold cyan]⚙ INFO:[/bold cyan] Executing {len(commands)} commands...")
             for cmd in commands:
-                print(f"  -> {cmd}")
+                console.print(f"  [dim cyan]→[/dim cyan] {cmd}")
                 cmd_output = self.execute_command_with_prompts(connection, cmd)
                 output += cmd_output + "\n"
                 time.sleep(0.5)
 
             # Automatically confirm changes
-            print("\n" + "="*60)
-            print("CONFIGURATION APPLIED")
-            print("="*60)
-            print("[INFO] Auto-confirming configuration changes...")
+            console.print()
+            console.print(Panel.fit(
+                "[bold green]CONFIGURATION APPLIED[/bold green]",
+                border_style="green"
+            ))
+            console.print("[bold cyan]⚙ INFO:[/bold cyan] Auto-confirming configuration changes...")
             confirm_output = connection.send_command('checkpoint confirm')
             output += confirm_output + "\n"
-            print("[SUCCESS] Configuration confirmed and saved!")
+            console.print("[bold green]✓ SUCCESS:[/bold green] Configuration confirmed and saved!")
             return True, output
 
         except Exception as e:
-            print(f"[ERROR] Failed during Aruba CX configuration: {e}")
-            print("[INFO] Checkpoint will auto-revert if active...")
+            console.print(f"[bold red]✗ ERROR:[/bold red] Failed during Aruba CX configuration: {e}")
+            console.print("[bold cyan]⚙ INFO:[/bold cyan] Checkpoint will auto-revert if active...")
             return False, output + f"\nERROR: {str(e)}"
 
     def configure_cisco_ios_xe(self, connection, commands: List[str]) -> Tuple[bool, str]:
@@ -184,31 +196,31 @@ class SwitchConfigurator:
         try:
             # Check if archive is configured
             if not self.check_archive_configured(connection):
-                print("[WARN] Archive not configured, setting up now...")
+                console.print("[bold yellow]⚠ WARNING:[/bold yellow] Archive not configured, setting up now...")
                 success, archive_output = self.setup_archive(connection)
                 output += archive_output + "\n"
                 if not success:
-                    print("[ERROR] Cannot proceed without archive configuration")
+                    console.print("[bold red]✗ ERROR:[/bold red] Cannot proceed without archive configuration")
                     return False, output
             else:
-                print("[INFO] Archive already configured")
+                console.print("[bold cyan]⚙ INFO:[/bold cyan] Archive already configured")
 
-            print("[INFO] Entering configuration mode with revert timer (2 minutes)...")
+            console.print("[bold cyan]⚙ INFO:[/bold cyan] Entering configuration mode with revert timer (2 minutes)...")
             # Enter config mode with revert timer
             revert_output = connection.send_command('configure terminal revert timer 2', expect_string=r'#')
             output += revert_output + "\n"
 
             # Validate that revert timer was accepted
             if 'error' in revert_output.lower() or 'invalid' in revert_output.lower():
-                print("[ERROR] Failed to enter revert mode - archive may not be properly configured")
+                console.print("[bold red]✗ ERROR:[/bold red] Failed to enter revert mode - archive may not be properly configured")
                 return False, output
 
-            print("[INFO] Configuration mode entered - will auto-revert in 2 minutes if not confirmed")
+            console.print("[bold cyan]⚙ INFO:[/bold cyan] Configuration mode entered - will auto-revert in 2 minutes if not confirmed")
 
             # Execute commands
-            print(f"[INFO] Executing {len(commands)} commands...")
+            console.print(f"[bold cyan]⚙ INFO:[/bold cyan] Executing {len(commands)} commands...")
             for cmd in commands:
-                print(f"  -> {cmd}")
+                console.print(f"  [dim cyan]→[/dim cyan] {cmd}")
                 cmd_output = self.execute_command_with_prompts(connection, cmd)
                 output += cmd_output + "\n"
                 time.sleep(0.5)
@@ -217,22 +229,24 @@ class SwitchConfigurator:
             connection.send_command('end')
 
             # Automatically confirm changes
-            print("\n" + "="*60)
-            print("CONFIGURATION APPLIED")
-            print("="*60)
-            print("[INFO] Auto-confirming configuration changes...")
+            console.print()
+            console.print(Panel.fit(
+                "[bold green]CONFIGURATION APPLIED[/bold green]",
+                border_style="green"
+            ))
+            console.print("[bold cyan]⚙ INFO:[/bold cyan] Auto-confirming configuration changes...")
             confirm_output = connection.send_command('configure confirm')
             output += confirm_output + "\n"
 
             # Save configuration
             save_output = connection.send_command('write memory', expect_string=r'#')
             output += save_output + "\n"
-            print("[SUCCESS] Configuration confirmed and saved!")
+            console.print("[bold green]✓ SUCCESS:[/bold green] Configuration confirmed and saved!")
             return True, output
 
         except Exception as e:
-            print(f"[ERROR] Failed during Cisco IOS XE configuration: {e}")
-            print("[INFO] Configuration will auto-revert if active...")
+            console.print(f"[bold red]✗ ERROR:[/bold red] Failed during Cisco IOS XE configuration: {e}")
+            console.print("[bold cyan]⚙ INFO:[/bold cyan] Configuration will auto-revert if active...")
             return False, output + f"\nERROR: {str(e)}"
 
     def substitute_variables(self, commands: List[str], switch: Dict) -> List[str]:
@@ -246,7 +260,7 @@ class SwitchConfigurator:
                 substituted.append(substituted_cmd)
             except KeyError as e:
                 # If a variable is missing, keep the command as-is and warn
-                print(f"[WARN] Variable {e} not found in CSV for command: {cmd}")
+                console.print(f"[bold yellow]⚠ WARNING:[/bold yellow] Variable {e} not found in CSV for command: {cmd}")
                 substituted.append(cmd)
         return substituted
 
@@ -274,9 +288,13 @@ class SwitchConfigurator:
         ip_address = switch.get('ip address', '')
         os_type = switch.get('vendor', 'cisco').lower()
 
-        print(f"\n{'='*60}")
-        print(f"Connecting to {hostname} ({ip_address}) - OS: {os_type}")
-        print(f"{'='*60}")
+        console.print()
+        console.print(Panel(
+            f"[bold white]Connecting to[/bold white] [cyan]{hostname}[/cyan] [dim]({ip_address})[/dim]\n"
+            f"[bold white]OS:[/bold white] [yellow]{os_type.upper()}[/yellow]",
+            border_style="cyan",
+            box=box.ROUNDED
+        ))
 
         device_type = self.get_device_type(os_type)
 
@@ -290,9 +308,9 @@ class SwitchConfigurator:
 
         try:
             # Connect to device
-            print(f"[INFO] Establishing SSH connection...")
+            console.print(f"[bold cyan]⚙ INFO:[/bold cyan] Establishing SSH connection...")
             connection = ConnectHandler(**device)
-            print(f"[SUCCESS] Connected to {hostname}")
+            console.print(f"[bold green]✓ SUCCESS:[/bold green] Connected to {hostname}")
 
             # Substitute variables in commands with switch-specific values
             switch_commands = self.substitute_variables(self.commands, switch)
@@ -306,70 +324,74 @@ class SwitchConfigurator:
 
             # Disconnect
             connection.disconnect()
-            print(f"[INFO] Disconnected from {hostname}")
+            console.print(f"[bold cyan]⚙ INFO:[/bold cyan] Disconnected from {hostname}")
 
             return success
 
         except NetmikoTimeoutException:
-            print(f"[ERROR] Connection timeout to {hostname} ({ip_address})")
+            console.print(f"[bold red]✗ ERROR:[/bold red] Connection timeout to {hostname} ({ip_address})")
             return False
         except NetmikoAuthenticationException:
-            print(f"[ERROR] Authentication failed to {hostname} ({ip_address})")
+            console.print(f"[bold red]✗ ERROR:[/bold red] Authentication failed to {hostname} ({ip_address})")
             return False
         except Exception as e:
-            print(f"[ERROR] Failed to configure {hostname}: {e}")
+            console.print(f"[bold red]✗ ERROR:[/bold red] Failed to configure {hostname}: {e}")
             return False
 
 
 def main():
     """Main execution function"""
-    print("="*60)
-    print("Network Switch Configurator")
-    print("Automated SSH Configuration with Rollback Support")
-    print("="*60)
+    console.print()
+    console.print(Panel.fit(
+        "[bold cyan]Network Switch Configurator[/bold cyan]\n"
+        "[dim]Automated SSH Configuration with Rollback Support[/dim]",
+        border_style="cyan",
+        box=box.DOUBLE
+    ))
 
     # Get credentials
-    print("\nPlease enter SSH credentials:")
-    username = input("Username: ").strip()
+    console.print("\n[bold]Please enter SSH credentials:[/bold]")
+    username = Prompt.ask("[cyan]Username[/cyan]").strip()
     if not username:
-        print("[ERROR] Username cannot be empty")
+        console.print("[bold red]✗ ERROR:[/bold red] Username cannot be empty")
         sys.exit(1)
 
     password = getpass.getpass("Password: ")
     if not password:
-        print("[ERROR] Password cannot be empty")
+        console.print("[bold red]✗ ERROR:[/bold red] Password cannot be empty")
         sys.exit(1)
 
     # Initialize configurator
     configurator = SwitchConfigurator(username, password)
 
     # Load files
-    print("\nLoading configuration files...")
+    console.print("\n[bold]Loading configuration files...[/bold]")
     switches = configurator.load_switches('switches.csv')
     commands = configurator.load_commands('commands.txt')
     configurator.load_prompt_handlers('prompthandling.txt')
 
     if not switches:
-        print("[ERROR] No switches to configure")
+        console.print("[bold red]✗ ERROR:[/bold red] No switches to configure")
         sys.exit(1)
 
     if not commands:
-        print("[ERROR] No commands to execute")
+        console.print("[bold red]✗ ERROR:[/bold red] No commands to execute")
         sys.exit(1)
 
     # Display summary
-    print(f"\n{'='*60}")
-    print(f"CONFIGURATION SUMMARY")
-    print(f"{'='*60}")
-    print(f"Switches to configure: {len(switches)}")
-    print(f"Commands to execute: {len(commands)}")
-    print(f"Prompt handlers: {len(configurator.prompt_handlers)}")
-    print(f"{'='*60}")
+    console.print()
+    summary_table = Table(title="Configuration Summary", box=box.ROUNDED, border_style="cyan")
+    summary_table.add_column("Parameter", style="cyan", justify="left")
+    summary_table.add_column("Value", style="green", justify="right")
+    summary_table.add_row("Switches to configure", str(len(switches)))
+    summary_table.add_row("Commands to execute", str(len(commands)))
+    summary_table.add_row("Prompt handlers", str(len(configurator.prompt_handlers)))
+    console.print(summary_table)
 
     # Confirm before proceeding
-    proceed = input("\nProceed with configuration? (yes/no): ").strip().lower()
-    if proceed != 'yes' and proceed != 'y':
-        print("[INFO] Configuration cancelled by user")
+    console.print()
+    if not Confirm.ask("[bold yellow]Proceed with configuration?[/bold yellow]", default=False):
+        console.print("[bold cyan]⚙ INFO:[/bold cyan] Configuration cancelled by user")
         sys.exit(0)
 
     # Configure each switch
@@ -378,28 +400,62 @@ def main():
         success = configurator.configure_switch(switch)
         results.append({
             'hostname': switch.get('switchname', 'unknown'),
+            'ip': switch.get('ip address', 'unknown'),
+            'vendor': switch.get('vendor', 'unknown'),
             'success': success
         })
 
     # Display final results
-    print(f"\n{'='*60}")
-    print("FINAL RESULTS")
-    print(f"{'='*60}")
+    console.print()
+    results_table = Table(
+        title="[bold]Final Results[/bold]",
+        box=box.DOUBLE,
+        border_style="cyan",
+        show_header=True,
+        header_style="bold cyan"
+    )
+    results_table.add_column("Status", justify="center", width=10)
+    results_table.add_column("Hostname", style="white", justify="left")
+    results_table.add_column("IP Address", style="dim", justify="left")
+    results_table.add_column("Vendor", style="yellow", justify="left")
+
     for result in results:
-        status = "[SUCCESS]" if result['success'] else "[FAILED]"
-        print(f"{status} {result['hostname']}")
-    print(f"{'='*60}")
+        status_icon = "[bold green]✓ OK[/bold green]" if result['success'] else "[bold red]✗ FAIL[/bold red]"
+        results_table.add_row(
+            status_icon,
+            result['hostname'],
+            result['ip'],
+            result['vendor']
+        )
+
+    console.print(results_table)
 
     success_count = sum(1 for r in results if r['success'])
-    print(f"\nCompleted: {success_count}/{len(results)} switches configured successfully")
+    total_count = len(results)
+
+    if success_count == total_count:
+        status_style = "bold green"
+        status_msg = "All switches configured successfully!"
+    elif success_count > 0:
+        status_style = "bold yellow"
+        status_msg = f"Partial success: {success_count}/{total_count} switches configured"
+    else:
+        status_style = "bold red"
+        status_msg = "All configurations failed"
+
+    console.print()
+    console.print(Panel.fit(
+        f"[{status_style}]{status_msg}[/{status_style}]",
+        border_style=status_style.split()[1] if status_style else "white"
+    ))
 
 
 if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
-        print("\n[INFO] Configuration cancelled by user (Ctrl+C)")
+        console.print("\n[bold cyan]⚙ INFO:[/bold cyan] Configuration cancelled by user (Ctrl+C)")
         sys.exit(0)
     except Exception as e:
-        print(f"\n[ERROR] Unexpected error: {e}")
+        console.print(f"\n[bold red]✗ ERROR:[/bold red] Unexpected error: {e}")
         sys.exit(1)
