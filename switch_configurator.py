@@ -169,8 +169,10 @@ class SwitchConfigurator:
         output = ""
         try:
             thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Setting up checkpoint with auto-confirm...")
-            # Create checkpoint with auto-confirm
-            checkpoint_output = connection.send_command('checkpoint auto confirm')
+            # Create checkpoint with auto-confirm (use timing mode for better compatibility)
+            checkpoint_output = connection.send_command('checkpoint auto confirm',
+                                                       read_timeout=60,
+                                                       expect_string=r'.*#')
             output += checkpoint_output + "\n"
             thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Checkpoint created with auto-confirm enabled")
 
@@ -188,7 +190,9 @@ class SwitchConfigurator:
                 border_style="green"
             ))
             thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Auto-confirming configuration changes...")
-            confirm_output = connection.send_command('checkpoint confirm')
+            confirm_output = connection.send_command('checkpoint confirm',
+                                                     read_timeout=60,
+                                                     expect_string=r'.*#')
             output += confirm_output + "\n"
             thread_safe_print("[bold green]✓ SUCCESS:[/bold green] Configuration confirmed and saved!")
             return True, output
@@ -306,6 +310,7 @@ class SwitchConfigurator:
             enter_config_mode=enter_config_mode,
             exit_config_mode=False,
             cmd_verify=False,
+            read_timeout=120,  # Increased timeout for slow devices
         ) + "\n"
 
     def execute_configuration_commands(self, connection, commands: List[str], *, already_in_config_mode: bool) -> str:
@@ -366,7 +371,10 @@ class SwitchConfigurator:
             'host': ip_address,
             'username': self.username,
             'password': self.password,
-            'timeout': 60
+            'timeout': 120,           # Increased timeout for slow devices
+            'session_timeout': 120,   # Command execution timeout
+            'global_delay_factor': 2, # Slow down for device compatibility
+            'fast_cli': False,        # Disable fast CLI to avoid prompt detection issues
         }
 
         try:
