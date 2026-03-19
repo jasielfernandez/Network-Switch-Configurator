@@ -10,7 +10,7 @@ import sys
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from netmiko import ConnectHandler, NetmikoTimeoutException, NetmikoAuthenticationException
 from rich.console import Console
 from rich.panel import Panel
@@ -176,11 +176,10 @@ class SwitchConfigurator:
 
             # Execute commands
             thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Executing {len(commands)} commands...")
-            for cmd in commands:
-                thread_safe_print(f"  [dim cyan]→[/dim cyan] {cmd}")
-                cmd_output = self.execute_command_with_prompts(connection, cmd)
-                output += cmd_output + "\n"
-                time.sleep(0.5)
+            output += self.execute_configuration_commands(connection, commands, already_in_config_mode=False)
+
+            # Exit config mode before confirming checkpoint
+            connection.exit_config_mode()
 
             # Automatically confirm changes
             thread_safe_print()
@@ -228,14 +227,10 @@ class SwitchConfigurator:
 
             # Execute commands
             thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Executing {len(commands)} commands...")
-            for cmd in commands:
-                thread_safe_print(f"  [dim cyan]→[/dim cyan] {cmd}")
-                cmd_output = self.execute_command_with_prompts(connection, cmd)
-                output += cmd_output + "\n"
-                time.sleep(0.5)
+            output += self.execute_configuration_commands(connection, commands, already_in_config_mode=True)
 
             # Exit config mode
-            connection.send_command('end')
+            connection.exit_config_mode()
 
             # Automatically confirm changes
             thread_safe_print()
@@ -273,23 +268,82 @@ class SwitchConfigurator:
                 substituted.append(cmd)
         return substituted
 
-    def execute_command_with_prompts(self, connection, command: str) -> str:
-        """Execute command and handle any prompts based on prompt_handlers"""
-        try:
-            # Check if this command needs prompt handling
-            for prompt_match, response in self.prompt_handlers.items():
-                if prompt_match.lower() in command.lower():
-                    # Send command and expect a prompt
-                    output = connection.send_command_timing(command)
-                    # If there's a prompt, send the response
-                    if any(p in output.lower() for p in ['[y/n]', '(y/n)', 'confirm', '[yes/no]']):
-                        output += connection.send_command_timing(response)
-                    return output
+    def get_prompt_response(self, command: str) -> Optional[str]:
+        """Return the configured prompt response for a command, if one exists."""
+        for prompt_match, response in self.prompt_handlers.items():
+            if prompt_match.lower() in command.lower():
+                return response
+        return None
 
-            # Normal command execution
+    def execute_command_with_prompts(self, connection, command: str, *, in_config_mode: bool = False) -> str:
+        """Execute a command and optionally respond to interactive prompts."""
+        try:
+            response = self.get_prompt_response(command)
+            if response is not None:
+                output = connection.send_command_timing(command)
+                if any(p in output.lower() for p in ['[y/n]', '(y/n)', 'confirm', '[yes/no]']):
+                    output += connection.send_command_timing(response)
+                return output
+
+            if in_config_mode:
+                return connection.send_config_set(
+                    [command],
+                    enter_config_mode=False,
+                    exit_config_mode=False,
+                    cmd_verify=False,
+                )
+
             return connection.send_command(command, expect_string=r'#')
         except Exception as e:
-            return f"ERROR executing '{command}': {str(e)}"
+            raise RuntimeError(f"ERROR executing '{command}': {str(e)}") from e
+
+    def execute_configuration_batch(self, connection, commands: List[str], *, enter_config_mode: bool) -> str:
+        """Send a batch of non-interactive configuration commands through Netmiko config mode."""
+        for cmd in commands:
+            thread_safe_print(f"  [dim cyan]→[/dim cyan] {cmd}")
+        return connection.send_config_set(
+            commands,
+            enter_config_mode=enter_config_mode,
+            exit_config_mode=False,
+            cmd_verify=False,
+        ) + "\n"
+
+    def execute_configuration_commands(self, connection, commands: List[str], *, already_in_config_mode: bool) -> str:
+        """Execute configuration commands in-order, batching normal lines and isolating prompt-driven ones."""
+        if not commands:
+            raise ValueError("No configuration commands were provided")
+
+        output = ""
+        in_config_mode = already_in_config_mode
+        pending_batch: List[str] = []
+
+        def flush_pending_batch() -> None:
+            nonlocal output, in_config_mode, pending_batch
+            if not pending_batch:
+                return
+            output += self.execute_configuration_batch(
+                connection,
+                pending_batch,
+                enter_config_mode=not in_config_mode,
+            )
+            in_config_mode = True
+            pending_batch = []
+
+        for cmd in commands:
+            if self.get_prompt_response(cmd) is None:
+                pending_batch.append(cmd)
+                continue
+
+            flush_pending_batch()
+            if not in_config_mode:
+                connection.config_mode()
+                in_config_mode = True
+
+            thread_safe_print(f"  [dim cyan]→[/dim cyan] {cmd}")
+            output += self.execute_command_with_prompts(connection, cmd, in_config_mode=True) + "\n"
+
+        flush_pending_batch()
+        return output
 
     def configure_switch(self, switch: Dict) -> bool:
         """Configure a single switch (thread-safe)"""

@@ -11,6 +11,7 @@ Automated SSH-based network switch configuration tool with built-in rollback sup
 - **Rich CLI Interface**: Beautiful colored output with tables, panels, and progress bars
 - **Prompt Handling**: Automatically handle interactive prompts during configuration
 - **Variable Substitution**: Use CSV column values in commands with `{variable}` syntax
+- **Real Configuration Mode Execution**: Sends configuration commands through Netmiko's config-mode APIs so changes like `hostname test` are actually applied on-device
 - **Secure Credential Input**: Password is masked during input
 
 ## Installation
@@ -67,6 +68,7 @@ SWITCH-ACC-03,192.168.3.3,aruba,Building C Floor 1,30,BLDG-C
 ### 2. commands.txt
 
 Text file with commands to execute, one per line. Lines starting with `#` are treated as comments.
+Configuration commands are sent through the device's configuration mode, so state-changing lines such as `hostname test` are applied instead of being treated like show commands.
 
 **Variable Substitution:**
 Use `{column_name}` to insert values from the CSV file. Variables are replaced with switch-specific values from switches.csv.
@@ -91,6 +93,7 @@ snmp-server location {location}
 ### 3. prompthandling.txt
 
 Configuration for handling interactive prompts. Format: `command_keyword | response`
+Prompt-handled commands still run in-order with surrounding configuration commands; non-interactive config lines on either side remain batched for efficient delivery.
 
 Special responses:
 - `RETURN` or `ENTER`: Sends carriage return
@@ -145,7 +148,7 @@ The tool uses multi-threading to configure multiple switches simultaneously:
 
 #### For Aruba CX Switches:
 1. Program executes `checkpoint auto confirm` to enable auto-confirmation
-2. Commands are executed with variable substitution
+2. Commands are executed in configuration mode with variable substitution
 3. Configuration is automatically confirmed with `checkpoint confirm`
 4. Changes are saved to the switch
 
@@ -160,7 +163,7 @@ The tool uses multi-threading to configure multiple switches simultaneously:
      ```
    - Saves archive configuration permanently
 2. Program executes `configure terminal revert timer 2` to enter config mode with rollback protection
-3. Commands are executed with variable substitution
+3. Commands are executed in configuration mode with variable substitution
 4. Configuration is automatically confirmed with `configure confirm`
 5. Changes are saved with `write memory`
 
