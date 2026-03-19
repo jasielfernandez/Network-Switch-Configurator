@@ -8,18 +8,27 @@ import csv
 import getpass
 import sys
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Tuple
 from netmiko import ConnectHandler, NetmikoTimeoutException, NetmikoAuthenticationException
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.prompt import Prompt, Confirm
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 from rich.style import Style
 from rich import box
 
-# Initialize rich console
+# Initialize thread-safe rich console
 console = Console()
+console_lock = threading.Lock()
+
+
+def thread_safe_print(*args, **kwargs):
+    """Thread-safe wrapper for console.print"""
+    with console_lock:
+        console.print(*args, **kwargs)
 
 
 class SwitchConfigurator:
@@ -130,7 +139,7 @@ class SwitchConfigurator:
         """Configure archive on Cisco device if not already set up"""
         output = ""
         try:
-            console.print("[bold cyan]⚙ INFO:[/bold cyan] Configuring archive for rollback support...")
+            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Configuring archive for rollback support...")
 
             # Configure archive
             archive_commands = [
@@ -149,45 +158,45 @@ class SwitchConfigurator:
             save_output = connection.send_command('write memory', expect_string=r'#')
             output += save_output + "\n"
 
-            console.print("[bold green]✓ SUCCESS:[/bold green] Archive configured successfully")
+            thread_safe_print("[bold green]✓ SUCCESS:[/bold green] Archive configured successfully")
             return True, output
         except Exception as e:
-            console.print(f"[bold red]✗ ERROR:[/bold red] Failed to configure archive: {e}")
+            thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to configure archive: {e}")
             return False, output + f"\nERROR: {str(e)}"
 
     def configure_aruba_cx(self, connection, commands: List[str]) -> Tuple[bool, str]:
         """Configure Aruba CX switch with checkpoint auto confirm"""
         output = ""
         try:
-            console.print("[bold cyan]⚙ INFO:[/bold cyan] Setting up checkpoint with auto-confirm...")
+            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Setting up checkpoint with auto-confirm...")
             # Create checkpoint with auto-confirm
             checkpoint_output = connection.send_command('checkpoint auto confirm')
             output += checkpoint_output + "\n"
-            console.print("[bold cyan]⚙ INFO:[/bold cyan] Checkpoint created with auto-confirm enabled")
+            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Checkpoint created with auto-confirm enabled")
 
             # Execute commands
-            console.print(f"[bold cyan]⚙ INFO:[/bold cyan] Executing {len(commands)} commands...")
+            thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Executing {len(commands)} commands...")
             for cmd in commands:
-                console.print(f"  [dim cyan]→[/dim cyan] {cmd}")
+                thread_safe_print(f"  [dim cyan]→[/dim cyan] {cmd}")
                 cmd_output = self.execute_command_with_prompts(connection, cmd)
                 output += cmd_output + "\n"
                 time.sleep(0.5)
 
             # Automatically confirm changes
-            console.print()
-            console.print(Panel.fit(
+            thread_safe_print()
+            thread_safe_print(Panel.fit(
                 "[bold green]CONFIGURATION APPLIED[/bold green]",
                 border_style="green"
             ))
-            console.print("[bold cyan]⚙ INFO:[/bold cyan] Auto-confirming configuration changes...")
+            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Auto-confirming configuration changes...")
             confirm_output = connection.send_command('checkpoint confirm')
             output += confirm_output + "\n"
-            console.print("[bold green]✓ SUCCESS:[/bold green] Configuration confirmed and saved!")
+            thread_safe_print("[bold green]✓ SUCCESS:[/bold green] Configuration confirmed and saved!")
             return True, output
 
         except Exception as e:
-            console.print(f"[bold red]✗ ERROR:[/bold red] Failed during Aruba CX configuration: {e}")
-            console.print("[bold cyan]⚙ INFO:[/bold cyan] Checkpoint will auto-revert if active...")
+            thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed during Aruba CX configuration: {e}")
+            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Checkpoint will auto-revert if active...")
             return False, output + f"\nERROR: {str(e)}"
 
     def configure_cisco_ios_xe(self, connection, commands: List[str]) -> Tuple[bool, str]:
@@ -196,31 +205,31 @@ class SwitchConfigurator:
         try:
             # Check if archive is configured
             if not self.check_archive_configured(connection):
-                console.print("[bold yellow]⚠ WARNING:[/bold yellow] Archive not configured, setting up now...")
+                thread_safe_print("[bold yellow]⚠ WARNING:[/bold yellow] Archive not configured, setting up now...")
                 success, archive_output = self.setup_archive(connection)
                 output += archive_output + "\n"
                 if not success:
-                    console.print("[bold red]✗ ERROR:[/bold red] Cannot proceed without archive configuration")
+                    thread_safe_print("[bold red]✗ ERROR:[/bold red] Cannot proceed without archive configuration")
                     return False, output
             else:
-                console.print("[bold cyan]⚙ INFO:[/bold cyan] Archive already configured")
+                thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Archive already configured")
 
-            console.print("[bold cyan]⚙ INFO:[/bold cyan] Entering configuration mode with revert timer (2 minutes)...")
+            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Entering configuration mode with revert timer (2 minutes)...")
             # Enter config mode with revert timer
             revert_output = connection.send_command('configure terminal revert timer 2', expect_string=r'#')
             output += revert_output + "\n"
 
             # Validate that revert timer was accepted
             if 'error' in revert_output.lower() or 'invalid' in revert_output.lower():
-                console.print("[bold red]✗ ERROR:[/bold red] Failed to enter revert mode - archive may not be properly configured")
+                thread_safe_print("[bold red]✗ ERROR:[/bold red] Failed to enter revert mode - archive may not be properly configured")
                 return False, output
 
-            console.print("[bold cyan]⚙ INFO:[/bold cyan] Configuration mode entered - will auto-revert in 2 minutes if not confirmed")
+            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Configuration mode entered - will auto-revert in 2 minutes if not confirmed")
 
             # Execute commands
-            console.print(f"[bold cyan]⚙ INFO:[/bold cyan] Executing {len(commands)} commands...")
+            thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Executing {len(commands)} commands...")
             for cmd in commands:
-                console.print(f"  [dim cyan]→[/dim cyan] {cmd}")
+                thread_safe_print(f"  [dim cyan]→[/dim cyan] {cmd}")
                 cmd_output = self.execute_command_with_prompts(connection, cmd)
                 output += cmd_output + "\n"
                 time.sleep(0.5)
@@ -229,24 +238,24 @@ class SwitchConfigurator:
             connection.send_command('end')
 
             # Automatically confirm changes
-            console.print()
-            console.print(Panel.fit(
+            thread_safe_print()
+            thread_safe_print(Panel.fit(
                 "[bold green]CONFIGURATION APPLIED[/bold green]",
                 border_style="green"
             ))
-            console.print("[bold cyan]⚙ INFO:[/bold cyan] Auto-confirming configuration changes...")
+            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Auto-confirming configuration changes...")
             confirm_output = connection.send_command('configure confirm')
             output += confirm_output + "\n"
 
             # Save configuration
             save_output = connection.send_command('write memory', expect_string=r'#')
             output += save_output + "\n"
-            console.print("[bold green]✓ SUCCESS:[/bold green] Configuration confirmed and saved!")
+            thread_safe_print("[bold green]✓ SUCCESS:[/bold green] Configuration confirmed and saved!")
             return True, output
 
         except Exception as e:
-            console.print(f"[bold red]✗ ERROR:[/bold red] Failed during Cisco IOS XE configuration: {e}")
-            console.print("[bold cyan]⚙ INFO:[/bold cyan] Configuration will auto-revert if active...")
+            thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed during Cisco IOS XE configuration: {e}")
+            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Configuration will auto-revert if active...")
             return False, output + f"\nERROR: {str(e)}"
 
     def substitute_variables(self, commands: List[str], switch: Dict) -> List[str]:
@@ -260,7 +269,7 @@ class SwitchConfigurator:
                 substituted.append(substituted_cmd)
             except KeyError as e:
                 # If a variable is missing, keep the command as-is and warn
-                console.print(f"[bold yellow]⚠ WARNING:[/bold yellow] Variable {e} not found in CSV for command: {cmd}")
+                thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Variable {e} not found in CSV for command: {cmd}")
                 substituted.append(cmd)
         return substituted
 
@@ -283,13 +292,13 @@ class SwitchConfigurator:
             return f"ERROR executing '{command}': {str(e)}"
 
     def configure_switch(self, switch: Dict) -> bool:
-        """Configure a single switch"""
+        """Configure a single switch (thread-safe)"""
         hostname = switch.get('switchname', 'unknown')
         ip_address = switch.get('ip address', '')
         os_type = switch.get('vendor', 'cisco').lower()
 
-        console.print()
-        console.print(Panel(
+        thread_safe_print()
+        thread_safe_print(Panel(
             f"[bold white]Connecting to[/bold white] [cyan]{hostname}[/cyan] [dim]({ip_address})[/dim]\n"
             f"[bold white]OS:[/bold white] [yellow]{os_type.upper()}[/yellow]",
             border_style="cyan",
@@ -308,9 +317,9 @@ class SwitchConfigurator:
 
         try:
             # Connect to device
-            console.print(f"[bold cyan]⚙ INFO:[/bold cyan] Establishing SSH connection...")
+            thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Establishing SSH connection...")
             connection = ConnectHandler(**device)
-            console.print(f"[bold green]✓ SUCCESS:[/bold green] Connected to {hostname}")
+            thread_safe_print(f"[bold green]✓ SUCCESS:[/bold green] Connected to {hostname}")
 
             # Substitute variables in commands with switch-specific values
             switch_commands = self.substitute_variables(self.commands, switch)
@@ -324,18 +333,18 @@ class SwitchConfigurator:
 
             # Disconnect
             connection.disconnect()
-            console.print(f"[bold cyan]⚙ INFO:[/bold cyan] Disconnected from {hostname}")
+            thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Disconnected from {hostname}")
 
             return success
 
         except NetmikoTimeoutException:
-            console.print(f"[bold red]✗ ERROR:[/bold red] Connection timeout to {hostname} ({ip_address})")
+            thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Connection timeout to {hostname} ({ip_address})")
             return False
         except NetmikoAuthenticationException:
-            console.print(f"[bold red]✗ ERROR:[/bold red] Authentication failed to {hostname} ({ip_address})")
+            thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Authentication failed to {hostname} ({ip_address})")
             return False
         except Exception as e:
-            console.print(f"[bold red]✗ ERROR:[/bold red] Failed to configure {hostname}: {e}")
+            thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to configure {hostname}: {e}")
             return False
 
 
@@ -394,16 +403,55 @@ def main():
         console.print("[bold cyan]⚙ INFO:[/bold cyan] Configuration cancelled by user")
         sys.exit(0)
 
-    # Configure each switch
+    # Configure switches concurrently (max 10 at a time)
+    console.print()
+    console.print(f"[bold cyan]⚙ INFO:[/bold cyan] Configuring switches with up to 10 concurrent threads...")
+    console.print()
+
     results = []
-    for switch in switches:
-        success = configurator.configure_switch(switch)
-        results.append({
-            'hostname': switch.get('switchname', 'unknown'),
-            'ip': switch.get('ip address', 'unknown'),
-            'vendor': switch.get('vendor', 'unknown'),
-            'success': success
-        })
+    max_workers = min(10, len(switches))  # Up to 10 concurrent threads
+
+    # Use ThreadPoolExecutor for concurrent execution
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console
+    ) as progress:
+        task = progress.add_task(
+            f"[cyan]Configuring {len(switches)} switches...",
+            total=len(switches)
+        )
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all switch configuration tasks
+            future_to_switch = {
+                executor.submit(configurator.configure_switch, switch): switch
+                for switch in switches
+            }
+
+            # Process completed tasks as they finish
+            for future in as_completed(future_to_switch):
+                switch = future_to_switch[future]
+                try:
+                    success = future.result()
+                    results.append({
+                        'hostname': switch.get('switchname', 'unknown'),
+                        'ip': switch.get('ip address', 'unknown'),
+                        'vendor': switch.get('vendor', 'unknown'),
+                        'success': success
+                    })
+                except Exception as e:
+                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Unexpected error for {switch.get('switchname', 'unknown')}: {e}")
+                    results.append({
+                        'hostname': switch.get('switchname', 'unknown'),
+                        'ip': switch.get('ip address', 'unknown'),
+                        'vendor': switch.get('vendor', 'unknown'),
+                        'success': False
+                    })
+                finally:
+                    progress.update(task, advance=1)
 
     # Display final results
     console.print()

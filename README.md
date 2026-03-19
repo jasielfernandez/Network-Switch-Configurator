@@ -4,11 +4,13 @@ Automated SSH-based network switch configuration tool with built-in rollback sup
 
 ## Features
 
+- **Concurrent Execution**: Configure up to 10 switches simultaneously with multi-threading for fast bulk operations
 - **Automatic Rollback Protection**: Uses checkpoint auto (Aruba CX) or configure terminal revert (Cisco IOS XE) to automatically revert changes if not confirmed within 2 minutes
 - **Multi-Vendor Support**: Works with both Aruba CX and Cisco IOS XE switches
-- **Bulk Configuration**: Configure multiple switches from a CSV file
+- **Bulk Configuration**: Configure multiple switches from a CSV file with progress tracking
+- **Rich CLI Interface**: Beautiful colored output with tables, panels, and progress bars
 - **Prompt Handling**: Automatically handle interactive prompts during configuration
-- **Session Logging**: Saves detailed logs for each switch configuration session
+- **Variable Substitution**: Use CSV column values in commands with `{variable}` syntax
 - **Secure Credential Input**: Password is masked during input
 
 ## Installation
@@ -22,7 +24,7 @@ pip install -r requirements.txt
 
 Or install manually:
 ```bash
-pip install netmiko paramiko
+pip install netmiko paramiko rich
 ```
 
 ## File Structure
@@ -122,7 +124,22 @@ python3 switch_configurator.py
 
 6. Enter your SSH credentials when prompted
 7. Review the configuration summary and confirm to proceed
-8. Commands are executed and automatically confirmed on each switch
+8. Commands are executed concurrently on up to 10 switches at a time with real-time progress tracking
+9. View the final results table showing success/failure status for each switch
+
+### Concurrent Execution
+
+The tool uses multi-threading to configure multiple switches simultaneously:
+
+- **Up to 10 concurrent threads**: Configure up to 10 switches at the same time
+- **Automatic thread management**: Thread pool size automatically adjusts based on the number of switches
+- **Thread-safe output**: All console output is properly synchronized across threads
+- **Real-time progress**: Live progress bar shows configuration status across all switches
+- **Parallel speedup**: Configuring 50 switches takes approximately the same time as 10 (instead of 5x longer)
+
+**Example Performance:**
+- Sequential (old): 10 switches × 30 seconds = 5 minutes
+- Concurrent (new): 10 switches in parallel = ~30 seconds total
 
 ### Execution Flow
 
