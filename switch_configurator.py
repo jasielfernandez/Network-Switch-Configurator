@@ -73,8 +73,22 @@ class SwitchConfigurator:
     def load_commands(self, commands_file: str) -> List[str]:
         """Load commands from text file"""
         try:
+            # Directive keywords that should be preserved
+            directives = ['#IF ', '#ELSE', '#ENDIF', '#FOR ', '#ENDFOR']
+
             with open(commands_file, 'r') as f:
-                self.commands = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+                self.commands = []
+                for line in f:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    # Keep directives, skip regular comments
+                    if stripped.startswith('#'):
+                        if any(stripped.startswith(d) for d in directives):
+                            self.commands.append(stripped)
+                    else:
+                        self.commands.append(stripped)
+
             console.print(f"[bold green]✓ INFO:[/bold green] Loaded {len(self.commands)} commands from {commands_file}")
             return self.commands
         except FileNotFoundError:
@@ -272,6 +286,210 @@ class SwitchConfigurator:
                 substituted.append(cmd)
         return substituted
 
+    def parse_commands_with_conditionals(self, commands: List[str], switch: Dict) -> List[str]:
+        """
+        Parse commands and evaluate conditional directives.
+        Returns flat list of commands to execute based on switch data.
+
+        Supports:
+        - #IF/#ELSE/#ENDIF blocks
+        - #FOR/#ENDFOR loops
+        - AND/OR logical operators
+        """
+        result = []
+        i = 0
+
+        while i < len(commands):
+            line = commands[i].strip()
+
+            if line.startswith('#IF '):
+                # Parse IF block
+                condition = line[4:].strip()
+                condition_met = self._evaluate_condition(condition, switch)
+                block_end, else_index = self._find_block_end(commands, i, 'IF')
+
+                if condition_met:
+                    # Include IF block
+                    if_block = commands[i+1:else_index if else_index else block_end]
+                    result.extend(self.parse_commands_with_conditionals(if_block, switch))
+                elif else_index:
+                    # Include ELSE block
+                    else_block = commands[else_index+1:block_end]
+                    result.extend(self.parse_commands_with_conditionals(else_block, switch))
+
+                i = block_end  # Skip to end of block
+
+            elif line.startswith('#FOR '):
+                # Parse FOR loop: #FOR variable_name IN {count}
+                try:
+                    for_parts = line[5:].strip().split(' IN ')
+                    if len(for_parts) != 2:
+                        thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Invalid FOR syntax: {line}")
+                        i += 1
+                        continue
+
+                    var_name = for_parts[0].strip()
+                    count_expr = for_parts[1].strip()
+                    count = self._get_loop_count(count_expr, switch)
+
+                    block_end = self._find_block_end(commands, i, 'FOR')[0]
+                    loop_block = commands[i+1:block_end]
+
+                    # Expand block N times with variable substitution
+                    for iteration in range(1, count + 1):
+                        # Create temporary switch dict with loop variable
+                        temp_switch = switch.copy()
+                        temp_switch[var_name] = str(iteration)
+
+                        # Recursively parse the block with the loop variable
+                        expanded = self.parse_commands_with_conditionals(loop_block, temp_switch)
+                        result.extend(expanded)
+
+                    i = block_end  # Skip to end of block
+
+                except Exception as e:
+                    thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Error parsing FOR loop: {e}")
+                    i += 1
+                    continue
+
+            elif line.startswith('#ENDIF') or line.startswith('#ELSE') or line.startswith('#ENDFOR'):
+                # Skip directive markers (handled by block parsing)
+                pass
+
+            elif line.startswith('#'):
+                # Regular comment - skip
+                pass
+
+            elif line:
+                # Regular command - include it
+                result.append(line)
+
+            i += 1
+
+        return result
+
+    def _evaluate_condition(self, condition: str, switch: Dict) -> bool:
+        """
+        Evaluate condition string against switch data.
+        Example: "{vendor} == cisco AND {location} == Main"
+        """
+        try:
+            # Handle AND/OR operators
+            if ' AND ' in condition:
+                parts = condition.split(' AND ')
+                return all(self._evaluate_simple_condition(p.strip(), switch) for p in parts)
+            elif ' OR ' in condition:
+                parts = condition.split(' OR ')
+                return any(self._evaluate_simple_condition(p.strip(), switch) for p in parts)
+            else:
+                return self._evaluate_simple_condition(condition, switch)
+        except Exception as e:
+            thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Error evaluating condition '{condition}': {e}")
+            return False
+
+    def _evaluate_simple_condition(self, condition: str, switch: Dict) -> bool:
+        """
+        Evaluate simple condition: "{column} operator value"
+        Supports: ==, !=, >, <, >=, <=
+        """
+        operators = ['==', '!=', '>=', '<=', '>', '<']
+
+        for op in operators:
+            if op in condition:
+                left, right = condition.split(op, 1)
+                left_val = left.strip()
+                right_val = right.strip().strip('"').strip("'")
+
+                # Substitute variables in left side
+                if left_val.startswith('{') and left_val.endswith('}'):
+                    column = left_val[1:-1]
+                    left_val = switch.get(column, '')
+
+                # Compare values
+                if op == '==':
+                    return str(left_val) == str(right_val)
+                elif op == '!=':
+                    return str(left_val) != str(right_val)
+                elif op in ['>', '<', '>=', '<=']:
+                    try:
+                        # Try numeric comparison
+                        left_num = float(left_val) if left_val else 0
+                        right_num = float(right_val) if right_val else 0
+                        if op == '>':
+                            return left_num > right_num
+                        elif op == '<':
+                            return left_num < right_num
+                        elif op == '>=':
+                            return left_num >= right_num
+                        elif op == '<=':
+                            return left_num <= right_num
+                    except (ValueError, TypeError):
+                        # Fall back to string comparison
+                        if op == '>':
+                            return str(left_val) > str(right_val)
+                        elif op == '<':
+                            return str(left_val) < str(right_val)
+                        elif op == '>=':
+                            return str(left_val) >= str(right_val)
+                        elif op == '<=':
+                            return str(left_val) <= str(right_val)
+
+        return False
+
+    def _get_loop_count(self, count_expr: str, switch: Dict) -> int:
+        """
+        Get loop count from expression.
+        Examples: "#FOR i IN {stack}" → int(switch['stack'])
+                  "#FOR i IN 5" → 5
+        """
+        count_expr = count_expr.strip()
+
+        # Variable reference
+        if count_expr.startswith('{') and count_expr.endswith('}'):
+            column = count_expr[1:-1]
+            value = switch.get(column, '0')
+            try:
+                return max(0, int(value))
+            except (ValueError, TypeError):
+                thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Invalid loop count '{value}' for {column}, using 0")
+                return 0
+
+        # Literal number
+        try:
+            return max(0, int(count_expr))
+        except (ValueError, TypeError):
+            thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Invalid loop count '{count_expr}', using 0")
+            return 0
+
+    def _find_block_end(self, commands: List[str], start_index: int, block_type: str) -> Tuple[int, Optional[int]]:
+        """
+        Find the matching end directive for a block.
+        Returns: (end_index, else_index)
+        - end_index: index of #ENDIF or #ENDFOR
+        - else_index: index of #ELSE (only for IF blocks), or None
+
+        Handles nested blocks correctly.
+        """
+        end_directive = f'#END{block_type}'
+        else_directive = '#ELSE' if block_type == 'IF' else None
+
+        depth = 1
+        else_index = None
+
+        for i in range(start_index + 1, len(commands)):
+            line = commands[i].strip()
+
+            if line.startswith(f'#{block_type} '):
+                depth += 1
+            elif line.startswith(end_directive):
+                depth -= 1
+                if depth == 0:
+                    return (i, else_index)
+            elif line.startswith('#ELSE') and depth == 1 and else_directive:
+                else_index = i
+
+        raise ValueError(f"Unmatched {block_type} block starting at line {start_index + 1}")
+
     def get_prompt_response(self, command: str) -> Optional[str]:
         """Return the configured prompt response for a command, if one exists."""
         for prompt_match, response in self.prompt_handlers.items():
@@ -383,8 +601,9 @@ class SwitchConfigurator:
             connection = ConnectHandler(**device)
             thread_safe_print(f"[bold green]✓ SUCCESS:[/bold green] Connected to {hostname}")
 
-            # Substitute variables in commands with switch-specific values
-            switch_commands = self.substitute_variables(self.commands, switch)
+            # Parse conditionals first, then substitute variables
+            parsed_commands = self.parse_commands_with_conditionals(self.commands, switch)
+            switch_commands = self.substitute_variables(parsed_commands, switch)
 
             # Determine OS and configure accordingly
             success = False

@@ -6,6 +6,40 @@
 # Use {column_name} to insert values from the CSV file
 # Example: {switchname}, {location}, {mgmt_vlan}, etc.
 # Variables are substituted per switch from the switches.csv columns
+#
+# CONDITIONAL LOGIC:
+# Use directives to control command execution based on CSV values
+#
+# IF/ELSE/ENDIF - Conditional blocks:
+#   #IF {column} == value
+#     commands here
+#   #ENDIF
+#
+#   #IF {vendor} == cisco
+#     cisco-specific commands
+#   #ELSE
+#     commands for other vendors
+#   #ENDIF
+#
+# FOR/ENDFOR - Loop blocks:
+#   #FOR variable_name IN {column_or_number}
+#     commands with {variable_name}
+#   #ENDFOR
+#
+#   #FOR i IN {stack}
+#     interface 1/{i}/48
+#   #ENDFOR
+#
+# Operators: ==, !=, >, <, >=, <=
+# Logical: AND, OR
+#
+# Example:
+#   #IF {vendor} == cisco AND {stack} > 0
+#     #FOR member IN {stack}
+#       interface 1/{member}/1
+#       description Stack member {member}
+#     #ENDFOR
+#   #ENDIF
 
 # Example using variables from CSV
 snmp-server location {location}
@@ -30,3 +64,47 @@ logging console informational
 
 # Hostname configuration example (optional)
 # hostname {switchname}
+
+# ============================================================================
+# CONDITIONAL LOGIC EXAMPLES (commented out - uncomment to use)
+# ============================================================================
+
+# Example 1: Vendor-specific configuration
+# #IF {vendor} == cisco
+#   archive
+#     path flash:backup
+#     maximum 5
+#   logging buffered 32768
+# #ENDIF
+#
+# #IF {vendor} == aruba
+#   checkpoint auto-confirm
+#   logging buffered 16384
+# #ENDIF
+
+# Example 2: Location-based configuration
+# #IF {location} == Main Data Center
+#   vlan 999
+#   name Emergency_Management
+#   exit
+# #ENDIF
+
+# Example 3: Stack configuration with FOR loop
+# Add 'stack' column to switches.csv (0 for standalone, 3 for 3-member stack)
+# #IF {stack} > 0
+#   #FOR member IN {stack}
+#     interface 1/{member}/48
+#     description Uplink from stack member {member}
+#     switchport mode trunk
+#     switchport trunk allowed vlan all
+#     exit
+#   #ENDFOR
+# #ENDIF
+
+# Example 4: Complex conditional with AND/OR
+# #IF {vendor} == cisco AND {mgmt_vlan} == 10
+#   interface vlan 10
+#   description Management_VLAN
+#   ip address 192.168.10.1 255.255.255.0
+#   exit
+# #ENDIF

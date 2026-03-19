@@ -90,6 +90,131 @@ exit
 snmp-server location {location}
 ```
 
+**Conditional Logic:**
+
+Control command execution with conditional directives and loops. Directives are evaluated before variable substitution.
+
+**IF/ELSE/ENDIF - Conditional Blocks:**
+```
+#IF {column} == value
+  commands executed when condition is true
+#ENDIF
+
+#IF {vendor} == cisco
+  archive
+    path flash:backup
+#ELSE
+  checkpoint auto-confirm
+#ENDIF
+```
+
+**FOR/ENDFOR - Loop Blocks:**
+```
+#FOR variable_name IN {column_or_number}
+  commands with {variable_name}
+#ENDFOR
+
+#FOR i IN {stack}
+  interface 1/{i}/48
+  description Uplink from stack member {i}
+#ENDFOR
+```
+
+**Supported Operators:**
+- Comparison: `==`, `!=`, `>`, `<`, `>=`, `<=`
+- Logical: `AND`, `OR`
+
+**Example - Stack Configuration:**
+
+Add a `stack` column to switches.csv (0 for standalone, 3 for a 3-member stack):
+```csv
+switchname,ip address,vendor,stack
+CORE-SW-01,10.0.1.1,cisco,0
+STACK-SW-02,10.0.2.1,cisco,3
+```
+
+In commands.txt:
+```
+# Only configure stack ports if stack > 0
+#IF {stack} > 0
+  #FOR member IN {stack}
+    interface 1/{member}/48
+    description Uplink from stack member {member}
+    switchport mode trunk
+    exit
+  #ENDFOR
+#ENDIF
+```
+
+For STACK-SW-02 (stack=3), this generates:
+```
+interface 1/1/48
+description Uplink from stack member 1
+switchport mode trunk
+exit
+interface 1/2/48
+description Uplink from stack member 2
+switchport mode trunk
+exit
+interface 1/3/48
+description Uplink from stack member 3
+switchport mode trunk
+exit
+```
+
+For CORE-SW-01 (stack=0), the entire block is skipped.
+
+**Example - Vendor-Specific Configuration:**
+```
+# Configure based on vendor
+#IF {vendor} == cisco
+  archive path flash:backup
+  logging buffered 32768
+#ENDIF
+
+#IF {vendor} == aruba
+  checkpoint auto-confirm
+  logging buffered 16384
+#ENDIF
+```
+
+**Example - Complex Conditions:**
+```
+# Multiple conditions with AND
+#IF {vendor} == cisco AND {location} == Main Data Center
+  snmp-server location {location}
+  vlan 999
+  name Emergency_Management
+#ENDIF
+
+# Multiple conditions with OR
+#IF {mgmt_vlan} == 10 OR {mgmt_vlan} == 20
+  vlan {mgmt_vlan}
+  name Management
+#ENDIF
+```
+
+**Nested Blocks:**
+
+You can nest IF blocks and FOR loops:
+```
+#IF {vendor} == cisco
+  #IF {stack} > 0
+    #FOR member IN {stack}
+      interface 1/{member}/1
+      description Stack member {member}
+    #ENDFOR
+  #ENDIF
+#ENDIF
+```
+
+**Notes:**
+- Directives are case-sensitive (use uppercase: `#IF`, `#FOR`, etc.)
+- Regular comments use lowercase `#` without directive keywords
+- Conditions are evaluated before variable substitution
+- Missing CSV columns evaluate to empty string (false in comparisons)
+- Numeric comparisons use float conversion when possible
+
 ### 3. prompthandling.txt
 
 Configuration for handling interactive prompts. Format: `command_keyword | response`
