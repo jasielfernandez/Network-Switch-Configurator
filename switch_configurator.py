@@ -9,7 +9,7 @@ import getpass
 import sys
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from typing import List, Dict, Tuple, Optional
 from netmiko import ConnectHandler, NetmikoTimeoutException, NetmikoAuthenticationException
 from rich.console import Console
@@ -23,6 +23,12 @@ from rich import box
 # Initialize thread-safe rich console
 console = Console()
 console_lock = threading.Lock()
+
+# Maximum iterations allowed in FOR loops to prevent memory exhaustion
+MAX_LOOP_ITERATIONS = 10000
+
+# Maximum time (in seconds) to wait for a single switch configuration
+THREAD_TIMEOUT = 600  # 10 minutes per switch
 
 
 def thread_safe_print(*args, **kwargs):
@@ -39,13 +45,15 @@ class SwitchConfigurator:
         self.password = password
         self.commands = []
         self.prompt_handlers = {}
+        self._commands_lock = threading.RLock()
+        self._handlers_lock = threading.RLock()
 
     def load_switches(self, csv_file: str) -> List[Dict]:
         """Load switch information from CSV file"""
         switches = []
         required_columns = {'switchname', 'ip address', 'vendor'}
         try:
-            with open(csv_file, 'r') as f:
+            with open(csv_file, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 # Validate required columns exist
                 if reader.fieldnames:
@@ -76,21 +84,22 @@ class SwitchConfigurator:
             # Directive keywords that should be preserved
             directives = ['#IF ', '#ELSE', '#ENDIF', '#FOR ', '#ENDFOR']
 
-            with open(commands_file, 'r') as f:
-                self.commands = []
-                for line in f:
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    # Keep directives, skip regular comments
-                    if stripped.startswith('#'):
-                        if any(stripped.startswith(d) for d in directives):
+            with self._commands_lock:
+                with open(commands_file, 'r', encoding='utf-8') as f:
+                    self.commands = []
+                    for line in f:
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        # Keep directives, skip regular comments
+                        if stripped.startswith('#'):
+                            if any(stripped.startswith(d) for d in directives):
+                                self.commands.append(stripped)
+                        else:
                             self.commands.append(stripped)
-                    else:
-                        self.commands.append(stripped)
 
-            console.print(f"[bold green]✓ INFO:[/bold green] Loaded {len(self.commands)} commands from {commands_file}")
-            return self.commands
+                console.print(f"[bold green]✓ INFO:[/bold green] Loaded {len(self.commands)} commands from {commands_file}")
+                return self.commands.copy()
         except FileNotFoundError:
             console.print(f"[bold red]✗ ERROR:[/bold red] File not found: {commands_file}")
             sys.exit(1)
@@ -101,22 +110,23 @@ class SwitchConfigurator:
     def load_prompt_handlers(self, prompt_file: str) -> Dict[str, str]:
         """Load prompt handling responses from file"""
         try:
-            with open(prompt_file, 'r') as f:
-                for line in f:
-                    if line.strip() and not line.startswith('#'):
-                        if '|' in line:
-                            prompt, response = line.strip().split('|', 1)
-                            response = response.strip()
-                            # Handle special keywords
-                            if response.upper() == 'RETURN' or response.upper() == 'ENTER':
-                                response = '\n'
-                            elif response.upper() == 'YES':
-                                response = 'yes\n'
-                            elif response.upper() == 'NO':
-                                response = 'no\n'
-                            self.prompt_handlers[prompt.strip()] = response
-            console.print(f"[bold green]✓ INFO:[/bold green] Loaded {len(self.prompt_handlers)} prompt handlers from {prompt_file}")
-            return self.prompt_handlers
+            with self._handlers_lock:
+                with open(prompt_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if line.strip() and not line.startswith('#'):
+                            if '|' in line:
+                                prompt, response = line.strip().split('|', 1)
+                                response = response.strip()
+                                # Handle special keywords
+                                if response.upper() == 'RETURN' or response.upper() == 'ENTER':
+                                    response = '\n'
+                                elif response.upper() == 'YES':
+                                    response = 'yes\n'
+                                elif response.upper() == 'NO':
+                                    response = 'no\n'
+                                self.prompt_handlers[prompt.strip()] = response
+                console.print(f"[bold green]✓ INFO:[/bold green] Loaded {len(self.prompt_handlers)} prompt handlers from {prompt_file}")
+                return self.prompt_handlers.copy()
         except FileNotFoundError:
             console.print(f"[bold yellow]⚠ WARNING:[/bold yellow] Prompt handling file not found: {prompt_file}, continuing without prompt handlers")
             return {}
@@ -138,18 +148,21 @@ class SwitchConfigurator:
         }
         return os_mapping.get(os_type.lower(), 'cisco_ios')
 
-    def check_archive_configured(self, connection) -> bool:
-        """Check if archive is configured on Cisco device"""
+    def check_archive_configured(self, connection: ConnectHandler) -> Tuple[bool, str]:
+        """
+        Check if archive is configured on Cisco device.
+        Returns: (is_configured, error_message)
+        """
         try:
-            output = connection.send_command('show archive')
+            output = connection.send_command('show archive', read_timeout=30)
             # If archive is configured, output will show path
             if 'flash:' in output.lower() or 'bootflash:' in output.lower():
-                return True
-            return False
-        except Exception:
-            return False
+                return True, ""
+            return False, "Archive not configured"
+        except Exception as e:
+            return False, f"Failed to check archive: {e}"
 
-    def setup_archive(self, connection) -> Tuple[bool, str]:
+    def setup_archive(self, connection: ConnectHandler) -> Tuple[bool, str]:
         """Configure archive on Cisco device if not already set up"""
         output = ""
         try:
@@ -168,9 +181,24 @@ class SwitchConfigurator:
                 cmd_output = connection.send_command(cmd, expect_string=r'#')
                 output += cmd_output + "\n"
 
+                # Validate each command succeeded
+                if 'error' in cmd_output.lower() or 'invalid' in cmd_output.lower():
+                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Archive setup command failed: {cmd}")
+                    return False, output + f"\nERROR: Command '{cmd}' failed"
+
             # Save the archive configuration
             save_output = connection.send_command('write memory', expect_string=r'#')
             output += save_output + "\n"
+
+            if 'error' in save_output.lower() or not ('[OK]' in save_output or 'Building configuration' in save_output):
+                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to save archive configuration")
+                return False, output + "\nERROR: Failed to save configuration"
+
+            # Verify archive was actually configured
+            verify_output = connection.send_command('show archive')
+            if 'flash:' not in verify_output.lower() and 'bootflash:' not in verify_output.lower():
+                thread_safe_print("[bold red]✗ ERROR:[/bold red] Archive setup failed validation")
+                return False, output + "\nERROR: Archive not configured after setup"
 
             thread_safe_print("[bold green]✓ SUCCESS:[/bold green] Archive configured successfully")
             return True, output
@@ -178,7 +206,7 @@ class SwitchConfigurator:
             thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to configure archive: {e}")
             return False, output + f"\nERROR: {str(e)}"
 
-    def configure_aruba_cx(self, connection, commands: List[str]) -> Tuple[bool, str]:
+    def configure_aruba_cx(self, connection: ConnectHandler, commands: List[str]) -> Tuple[bool, str]:
         """Configure Aruba CX switch with checkpoint auto confirm"""
         output = ""
         try:
@@ -188,6 +216,19 @@ class SwitchConfigurator:
                                                        read_timeout=60,
                                                        expect_string=r'.*#')
             output += checkpoint_output + "\n"
+
+            # Validate checkpoint was created
+            error_keywords = ['error', 'invalid', 'failed', 'not supported', 'unable to']
+            checkpoint_lower = checkpoint_output.lower()
+            for keyword in error_keywords:
+                if keyword in checkpoint_lower:
+                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Checkpoint creation failed")
+                    return False, output
+
+            # Positive confirmation - should see 'checkpoint' in response
+            if 'checkpoint' not in checkpoint_lower:
+                thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Checkpoint response unclear, proceeding with caution")
+
             thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Checkpoint created with auto-confirm enabled")
 
             # Execute commands
@@ -208,6 +249,15 @@ class SwitchConfigurator:
                                                      read_timeout=60,
                                                      expect_string=r'.*#')
             output += confirm_output + "\n"
+
+            # Validate confirmation succeeded
+            error_keywords = ['error', 'invalid', 'failed', 'not supported', 'unable to']
+            confirm_lower = confirm_output.lower()
+            for keyword in error_keywords:
+                if keyword in confirm_lower:
+                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to confirm checkpoint")
+                    return False, output
+
             thread_safe_print("[bold green]✓ SUCCESS:[/bold green] Configuration confirmed and saved!")
             return True, output
 
@@ -216,12 +266,16 @@ class SwitchConfigurator:
             thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Checkpoint will auto-revert if active...")
             return False, output + f"\nERROR: {str(e)}"
 
-    def configure_cisco_ios_xe(self, connection, commands: List[str]) -> Tuple[bool, str]:
+    def configure_cisco_ios_xe(self, connection: ConnectHandler, commands: List[str]) -> Tuple[bool, str]:
         """Configure Cisco IOS XE switch with configure terminal revert"""
         output = ""
         try:
             # Check if archive is configured
-            if not self.check_archive_configured(connection):
+            is_configured, error_msg = self.check_archive_configured(connection)
+            if error_msg and "Failed to check" in error_msg:
+                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Cannot verify archive status: {error_msg}")
+                return False, output + f"\nERROR: {error_msg}"
+            elif not is_configured:
                 thread_safe_print("[bold yellow]⚠ WARNING:[/bold yellow] Archive not configured, setting up now...")
                 success, archive_output = self.setup_archive(connection)
                 output += archive_output + "\n"
@@ -237,9 +291,12 @@ class SwitchConfigurator:
             output += revert_output + "\n"
 
             # Validate that revert timer was accepted
-            if 'error' in revert_output.lower() or 'invalid' in revert_output.lower():
-                thread_safe_print("[bold red]✗ ERROR:[/bold red] Failed to enter revert mode - archive may not be properly configured")
-                return False, output
+            error_keywords = ['error', 'invalid', 'failed', 'not supported']
+            revert_lower = revert_output.lower()
+            for keyword in error_keywords:
+                if keyword in revert_lower:
+                    thread_safe_print("[bold red]✗ ERROR:[/bold red] Failed to enter revert mode - archive may not be properly configured")
+                    return False, output
 
             thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Configuration mode entered - will auto-revert in 2 minutes if not confirmed")
 
@@ -260,9 +317,20 @@ class SwitchConfigurator:
             confirm_output = connection.send_command('configure confirm')
             output += confirm_output + "\n"
 
+            # Validate confirmation succeeded
+            if 'error' in confirm_output.lower() or 'invalid' in confirm_output.lower():
+                thread_safe_print("[bold red]✗ ERROR:[/bold red] Failed to confirm configuration")
+                return False, output
+
             # Save configuration
             save_output = connection.send_command('write memory', expect_string=r'#')
             output += save_output + "\n"
+
+            # Validate save succeeded
+            if 'error' in save_output.lower() or not ('[OK]' in save_output or 'Building configuration' in save_output):
+                thread_safe_print("[bold red]✗ ERROR:[/bold red] Failed to save configuration")
+                return False, output
+
             thread_safe_print("[bold green]✓ SUCCESS:[/bold green] Configuration confirmed and saved!")
             return True, output
 
@@ -356,7 +424,9 @@ class SwitchConfigurator:
 
                         # Recursively parse the block with the loop variable
                         expanded = self.parse_commands_with_conditionals(loop_block, temp_switch)
-                        result.extend(expanded)
+                        # Substitute variables in the expanded commands with the loop variable
+                        substituted = self.substitute_variables(expanded, temp_switch)
+                        result.extend(substituted)
 
                     # Skip to line after block end (block_end points to #ENDFOR)
                     i = block_end + 1
@@ -385,22 +455,32 @@ class SwitchConfigurator:
 
     def _evaluate_condition(self, condition: str, switch: Dict) -> bool:
         """
-        Evaluate condition string against switch data.
-        Example: "{vendor} == cisco AND {location} == Main"
+        Evaluate condition string against switch data with proper operator precedence.
+        AND has higher precedence than OR.
+        Example: "{vendor} == cisco AND {stack} > 0 OR {backup} == yes"
+        is evaluated as: "({vendor} == cisco AND {stack} > 0) OR {backup} == yes"
         """
         try:
-            # Handle AND/OR operators
-            if ' AND ' in condition:
-                parts = condition.split(' AND ')
-                return all(self._evaluate_simple_condition(p.strip(), switch) for p in parts)
-            elif ' OR ' in condition:
+            # Split on OR first (lower precedence)
+            if ' OR ' in condition:
                 parts = condition.split(' OR ')
-                return any(self._evaluate_simple_condition(p.strip(), switch) for p in parts)
+                return any(self._evaluate_and_condition(p.strip(), switch) for p in parts)
             else:
-                return self._evaluate_simple_condition(condition, switch)
+                return self._evaluate_and_condition(condition, switch)
         except Exception as e:
             thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Error evaluating condition '{condition}': {e}")
             return False
+
+    def _evaluate_and_condition(self, condition: str, switch: Dict) -> bool:
+        """
+        Evaluate AND conditions (higher precedence).
+        Example: "{vendor} == cisco AND {stack} > 0"
+        """
+        if ' AND ' in condition:
+            parts = condition.split(' AND ')
+            return all(self._evaluate_simple_condition(p.strip(), switch) for p in parts)
+        else:
+            return self._evaluate_simple_condition(condition, switch)
 
     def _evaluate_simple_condition(self, condition: str, switch: Dict) -> bool:
         """
@@ -455,9 +535,10 @@ class SwitchConfigurator:
 
     def _get_loop_count(self, count_expr: str, switch: Dict) -> int:
         """
-        Get loop count from expression.
+        Get loop count from expression with maximum limit.
         Examples: "#FOR i IN {stack}" → int(switch['stack'])
                   "#FOR i IN 5" → 5
+        Maximum iterations capped at MAX_LOOP_ITERATIONS to prevent memory exhaustion.
         """
         count_expr = count_expr.strip()
 
@@ -466,14 +547,22 @@ class SwitchConfigurator:
             column = count_expr[1:-1]
             value = switch.get(column, '0')
             try:
-                return max(0, int(value))
+                count = max(0, int(value))
+                if count > MAX_LOOP_ITERATIONS:
+                    thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Loop count {count} exceeds maximum {MAX_LOOP_ITERATIONS}, capping")
+                    return MAX_LOOP_ITERATIONS
+                return count
             except (ValueError, TypeError):
                 thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Invalid loop count '{value}' for {column}, using 0")
                 return 0
 
         # Literal number
         try:
-            return max(0, int(count_expr))
+            count = max(0, int(count_expr))
+            if count > MAX_LOOP_ITERATIONS:
+                thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Loop count {count} exceeds maximum {MAX_LOOP_ITERATIONS}, capping")
+                return MAX_LOOP_ITERATIONS
+            return count
         except (ValueError, TypeError):
             thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Invalid loop count '{count_expr}', using 0")
             return 0
@@ -507,14 +596,33 @@ class SwitchConfigurator:
 
         raise ValueError(f"Unmatched {block_type} block starting at line {start_index + 1}")
 
+    def _safe_disconnect(self, connection: Optional[ConnectHandler], hostname: str) -> None:
+        """Safely disconnect with proper error handling and resource cleanup"""
+        if connection is None:
+            return
+
+        try:
+            connection.disconnect()
+            thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Disconnected from {hostname}")
+        except Exception as e:
+            thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Error disconnecting from {hostname}: {e}")
+            # Force close the socket if disconnect fails
+            try:
+                if hasattr(connection, 'remote_conn') and connection.remote_conn:
+                    connection.remote_conn.close()
+            except (OSError, AttributeError):
+                # Socket might already be closed or connection object malformed
+                pass
+
     def get_prompt_response(self, command: str) -> Optional[str]:
         """Return the configured prompt response for a command, if one exists."""
-        for prompt_match, response in self.prompt_handlers.items():
-            if prompt_match.lower() in command.lower():
-                return response
+        with self._handlers_lock:
+            for prompt_match, response in self.prompt_handlers.items():
+                if prompt_match.lower() in command.lower():
+                    return response
         return None
 
-    def execute_command_with_prompts(self, connection, command: str, *, in_config_mode: bool = False) -> str:
+    def execute_command_with_prompts(self, connection: ConnectHandler, command: str, *, in_config_mode: bool = False) -> str:
         """Execute a command and optionally respond to interactive prompts."""
         try:
             response = self.get_prompt_response(command)
@@ -536,19 +644,33 @@ class SwitchConfigurator:
         except Exception as e:
             raise RuntimeError(f"ERROR executing '{command}': {str(e)}") from e
 
-    def execute_configuration_batch(self, connection, commands: List[str], *, enter_config_mode: bool) -> str:
+    def execute_configuration_batch(self, connection: ConnectHandler, commands: List[str], *, enter_config_mode: bool) -> str:
         """Send a batch of non-interactive configuration commands through Netmiko config mode."""
         for cmd in commands:
             thread_safe_print(f"  [dim cyan]→[/dim cyan] {cmd}")
-        return connection.send_config_set(
+
+        output = connection.send_config_set(
             commands,
             enter_config_mode=enter_config_mode,
             exit_config_mode=False,
-            cmd_verify=False,
+            cmd_verify=False,  # Keep for performance, check output manually
             read_timeout=120,  # Increased timeout for slow devices
-        ) + "\n"
+        )
 
-    def execute_configuration_commands(self, connection, commands: List[str], *, already_in_config_mode: bool) -> str:
+        # Check output for common error indicators
+        error_indicators = ['% invalid', '% incomplete', '% error', 'command not found', 'syntax error', '% unknown command']
+        output_lower = output.lower()
+
+        for indicator in error_indicators:
+            if indicator in output_lower:
+                # Find the line with error
+                for line in output.split('\n'):
+                    if indicator in line.lower():
+                        raise RuntimeError(f"Command execution failed: {line.strip()}")
+
+        return output + "\n"
+
+    def execute_configuration_commands(self, connection: ConnectHandler, commands: List[str], *, already_in_config_mode: bool) -> str:
         """Execute configuration commands in-order, batching normal lines and isolating prompt-driven ones."""
         if not commands:
             raise ValueError("No configuration commands were provided")
@@ -620,12 +742,24 @@ class SwitchConfigurator:
             thread_safe_print(f"[bold green]✓ SUCCESS:[/bold green] Connected to {hostname}")
 
             # Parse conditionals first, then substitute variables
-            parsed_commands = self.parse_commands_with_conditionals(self.commands, switch)
+            # Make a copy to avoid race conditions with shared state
+            with self._commands_lock:
+                commands_copy = self.commands.copy()
+
+            try:
+                parsed_commands = self.parse_commands_with_conditionals(commands_copy, switch)
+            except ValueError as e:
+                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Conditional parsing failed for {hostname}: {e}")
+                thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Falling back to commands without conditionals")
+                # Fallback: use original commands without conditional parsing (filter out directives)
+                parsed_commands = [cmd for cmd in commands_copy if not cmd.startswith('#')]
+
             switch_commands = self.substitute_variables(parsed_commands, switch)
 
             # Check for empty command list
             if not switch_commands:
                 thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] No commands to execute after conditional parsing for {hostname}")
+                self._safe_disconnect(connection, hostname)
                 return True  # Not an error, just no work to do
 
             # Determine OS and configure accordingly
@@ -636,34 +770,20 @@ class SwitchConfigurator:
                 success, output = self.configure_cisco_ios_xe(connection, switch_commands)
 
             # Disconnect
-            connection.disconnect()
-            thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Disconnected from {hostname}")
-
+            self._safe_disconnect(connection, hostname)
             return success
 
         except NetmikoTimeoutException:
             thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Connection timeout to {hostname} ({ip_address})")
-            if connection:
-                try:
-                    connection.disconnect()
-                except:
-                    pass
+            self._safe_disconnect(connection, hostname)
             return False
         except NetmikoAuthenticationException:
             thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Authentication failed to {hostname} ({ip_address})")
-            if connection:
-                try:
-                    connection.disconnect()
-                except:
-                    pass
+            self._safe_disconnect(connection, hostname)
             return False
         except Exception as e:
             thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to configure {hostname}: {e}")
-            if connection:
-                try:
-                    connection.disconnect()
-                except:
-                    pass
+            self._safe_disconnect(connection, hostname)
             return False
 
 
@@ -751,15 +871,23 @@ def main():
             }
 
             # Process completed tasks as they finish
-            for future in as_completed(future_to_switch):
+            for future in as_completed(future_to_switch, timeout=THREAD_TIMEOUT * len(switches)):
                 switch = future_to_switch[future]
                 try:
-                    success = future.result()
+                    success = future.result(timeout=THREAD_TIMEOUT)  # Per-thread timeout
                     results.append({
                         'hostname': switch.get('switchname', 'unknown'),
                         'ip': switch.get('ip address', 'unknown'),
                         'vendor': switch.get('vendor', 'unknown'),
                         'success': success
+                    })
+                except FuturesTimeoutError:
+                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Configuration timeout for {switch.get('switchname', 'unknown')} (>{THREAD_TIMEOUT}s)")
+                    results.append({
+                        'hostname': switch.get('switchname', 'unknown'),
+                        'ip': switch.get('ip address', 'unknown'),
+                        'vendor': switch.get('vendor', 'unknown'),
+                        'success': False
                     })
                 except Exception as e:
                     thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Unexpected error for {switch.get('switchname', 'unknown')}: {e}")
@@ -770,7 +898,8 @@ def main():
                         'success': False
                     })
                 finally:
-                    progress.update(task, advance=1)
+                    with console_lock:
+                        progress.update(task, advance=1)
 
     # Display final results
     console.print()

@@ -24,6 +24,7 @@ class ExecuteConfigurationCommandsTests(unittest.TestCase):
             enter_config_mode=True,
             exit_config_mode=False,
             cmd_verify=False,
+            read_timeout=120,
         )
         connection.config_mode.assert_not_called()
 
@@ -48,6 +49,7 @@ class ExecuteConfigurationCommandsTests(unittest.TestCase):
             enter_config_mode=False,
             exit_config_mode=False,
             cmd_verify=False,
+            read_timeout=120,
         )
         connection.config_mode.assert_not_called()
 
@@ -75,12 +77,14 @@ class ExecuteConfigurationCommandsTests(unittest.TestCase):
                     enter_config_mode=True,
                     exit_config_mode=False,
                     cmd_verify=False,
+                    read_timeout=120,
                 ),
                 unittest.mock.call(
                     ["logging buffered 16384"],
                     enter_config_mode=False,
                     exit_config_mode=False,
                     cmd_verify=False,
+                    read_timeout=120,
                 ),
             ],
         )
@@ -106,6 +110,7 @@ class ExecuteConfigurationCommandsTests(unittest.TestCase):
             enter_config_mode=False,
             exit_config_mode=False,
             cmd_verify=False,
+            read_timeout=120,
         )
 
     def test_empty_command_list_is_rejected(self):
