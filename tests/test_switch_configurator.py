@@ -402,6 +402,86 @@ class ConditionalLogicTests(unittest.TestCase):
 
         self.assertEqual(result, [])
 
+    def test_greater_than_or_equal_operator(self):
+        """Test >= operator (verifies operator precedence fix)"""
+        commands = [
+            "#IF {count} >= 3",
+            "config command",
+            "#ENDIF"
+        ]
+        switch = {"count": "3"}
+
+        result = self.configurator.parse_commands_with_conditionals(commands, switch)
+
+        self.assertEqual(result, ["config command"])
+
+    def test_less_than_or_equal_operator(self):
+        """Test <= operator (verifies operator precedence fix)"""
+        commands = [
+            "#IF {count} <= 5",
+            "config command",
+            "#ENDIF"
+        ]
+        switch = {"count": "3"}
+
+        result = self.configurator.parse_commands_with_conditionals(commands, switch)
+
+        self.assertEqual(result, ["config command"])
+
+    def test_commands_after_endif_are_included(self):
+        """Test that commands after #ENDIF are not skipped (bug fix verification)"""
+        commands = [
+            "#IF {vendor} == cisco",
+            "cisco command",
+            "#ENDIF",
+            "command after endif"
+        ]
+        switch = {"vendor": "cisco"}
+
+        result = self.configurator.parse_commands_with_conditionals(commands, switch)
+
+        self.assertEqual(result, ["cisco command", "command after endif"])
+
+    def test_commands_after_endfor_are_included(self):
+        """Test that commands after #ENDFOR are not skipped (bug fix verification)"""
+        commands = [
+            "#FOR i IN 2",
+            "loop command {i}",
+            "#ENDFOR",
+            "command after endfor"
+        ]
+        switch = {}
+
+        result = self.configurator.parse_commands_with_conditionals(commands, switch)
+
+        self.assertEqual(result, ["loop command 1", "loop command 2", "command after endfor"])
+
+    def test_variable_comparison_both_sides(self):
+        """Test comparing two CSV columns (verifies right-side substitution fix)"""
+        commands = [
+            "#IF {vlan1} == {vlan2}",
+            "vlans match",
+            "#ENDIF"
+        ]
+        switch = {"vlan1": "10", "vlan2": "10"}
+
+        result = self.configurator.parse_commands_with_conditionals(commands, switch)
+
+        self.assertEqual(result, ["vlans match"])
+
+    def test_variable_comparison_both_sides_not_equal(self):
+        """Test comparing two CSV columns that don't match"""
+        commands = [
+            "#IF {vlan1} == {vlan2}",
+            "should not appear",
+            "#ENDIF"
+        ]
+        switch = {"vlan1": "10", "vlan2": "20"}
+
+        result = self.configurator.parse_commands_with_conditionals(commands, switch)
+
+        self.assertEqual(result, [])
+
 
 if __name__ == "__main__":
     unittest.main()

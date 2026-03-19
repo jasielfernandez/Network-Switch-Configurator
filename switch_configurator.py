@@ -317,7 +317,9 @@ class SwitchConfigurator:
                     else_block = commands[else_index+1:block_end]
                     result.extend(self.parse_commands_with_conditionals(else_block, switch))
 
-                i = block_end  # Skip to end of block
+                # Skip to line after block end (block_end points to #ENDIF)
+                i = block_end + 1
+                continue
 
             elif line.startswith('#FOR '):
                 # Parse FOR loop: #FOR variable_name IN {count}
@@ -329,6 +331,17 @@ class SwitchConfigurator:
                         continue
 
                     var_name = for_parts[0].strip()
+
+                    # Validate variable name
+                    if not var_name.isidentifier():
+                        thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Invalid variable name '{var_name}' in FOR loop, skipping")
+                        i += 1
+                        continue
+
+                    # Warn if shadowing existing CSV column
+                    if var_name in switch:
+                        thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] FOR loop variable '{var_name}' shadows existing CSV column")
+
                     count_expr = for_parts[1].strip()
                     count = self._get_loop_count(count_expr, switch)
 
@@ -345,7 +358,9 @@ class SwitchConfigurator:
                         expanded = self.parse_commands_with_conditionals(loop_block, temp_switch)
                         result.extend(expanded)
 
-                    i = block_end  # Skip to end of block
+                    # Skip to line after block end (block_end points to #ENDFOR)
+                    i = block_end + 1
+                    continue
 
                 except Exception as e:
                     thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Error parsing FOR loop: {e}")
@@ -392,7 +407,9 @@ class SwitchConfigurator:
         Evaluate simple condition: "{column} operator value"
         Supports: ==, !=, >, <, >=, <=
         """
-        operators = ['==', '!=', '>=', '<=', '>', '<']
+        # CRITICAL: Check longer operators first to avoid incorrect splitting
+        # e.g., ">=" must be checked before ">"
+        operators = ['>=', '<=', '==', '!=', '>', '<']
 
         for op in operators:
             if op in condition:
@@ -404,6 +421,11 @@ class SwitchConfigurator:
                 if left_val.startswith('{') and left_val.endswith('}'):
                     column = left_val[1:-1]
                     left_val = switch.get(column, '')
+
+                # Substitute variables in right side
+                if right_val.startswith('{') and right_val.endswith('}'):
+                    column = right_val[1:-1]
+                    right_val = switch.get(column, '')
 
                 # Compare values
                 if op == '==':
@@ -424,15 +446,10 @@ class SwitchConfigurator:
                         elif op == '<=':
                             return left_num <= right_num
                     except (ValueError, TypeError):
-                        # Fall back to string comparison
-                        if op == '>':
-                            return str(left_val) > str(right_val)
-                        elif op == '<':
-                            return str(left_val) < str(right_val)
-                        elif op == '>=':
-                            return str(left_val) >= str(right_val)
-                        elif op == '<=':
-                            return str(left_val) <= str(right_val)
+                        # Numeric comparison failed - must be non-numeric values
+                        # Don't fall back to string comparison for safety
+                        thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Cannot compare non-numeric values with {op}: '{left_val}' {op} '{right_val}'")
+                        return False
 
         return False
 
@@ -595,6 +612,7 @@ class SwitchConfigurator:
             'fast_cli': False,        # Disable fast CLI to avoid prompt detection issues
         }
 
+        connection = None
         try:
             # Connect to device
             thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Establishing SSH connection...")
@@ -604,6 +622,11 @@ class SwitchConfigurator:
             # Parse conditionals first, then substitute variables
             parsed_commands = self.parse_commands_with_conditionals(self.commands, switch)
             switch_commands = self.substitute_variables(parsed_commands, switch)
+
+            # Check for empty command list
+            if not switch_commands:
+                thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] No commands to execute after conditional parsing for {hostname}")
+                return True  # Not an error, just no work to do
 
             # Determine OS and configure accordingly
             success = False
@@ -620,12 +643,27 @@ class SwitchConfigurator:
 
         except NetmikoTimeoutException:
             thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Connection timeout to {hostname} ({ip_address})")
+            if connection:
+                try:
+                    connection.disconnect()
+                except:
+                    pass
             return False
         except NetmikoAuthenticationException:
             thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Authentication failed to {hostname} ({ip_address})")
+            if connection:
+                try:
+                    connection.disconnect()
+                except:
+                    pass
             return False
         except Exception as e:
             thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to configure {hostname}: {e}")
+            if connection:
+                try:
+                    connection.disconnect()
+                except:
+                    pass
             return False
 
 
