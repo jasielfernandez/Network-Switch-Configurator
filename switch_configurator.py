@@ -12,6 +12,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from typing import List, Dict, Tuple, Optional
 from netmiko import ConnectHandler, NetmikoTimeoutException, NetmikoAuthenticationException
+from netmiko.base_connection import BaseConnection
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -148,7 +149,7 @@ class SwitchConfigurator:
         }
         return os_mapping.get(os_type.lower(), 'cisco_ios')
 
-    def check_archive_configured(self, connection: ConnectHandler) -> Tuple[bool, str]:
+    def check_archive_configured(self, connection: BaseConnection) -> Tuple[bool, str]:
         """
         Check if archive is configured on Cisco device.
         Returns: (is_configured, error_message)
@@ -162,7 +163,7 @@ class SwitchConfigurator:
         except Exception as e:
             return False, f"Failed to check archive: {e}"
 
-    def setup_archive(self, connection: ConnectHandler) -> Tuple[bool, str]:
+    def setup_archive(self, connection: BaseConnection) -> Tuple[bool, str]:
         """Configure archive on Cisco device if not already set up"""
         output = ""
         try:
@@ -206,7 +207,7 @@ class SwitchConfigurator:
             thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to configure archive: {e}")
             return False, output + f"\nERROR: {str(e)}"
 
-    def configure_aruba_cx(self, connection: ConnectHandler, commands: List[str]) -> Tuple[bool, str]:
+    def configure_aruba_cx(self, connection: BaseConnection, commands: List[str]) -> Tuple[bool, str]:
         """Configure Aruba CX switch with checkpoint auto confirm"""
         output = ""
         try:
@@ -266,7 +267,7 @@ class SwitchConfigurator:
             thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Checkpoint will auto-revert if active...")
             return False, output + f"\nERROR: {str(e)}"
 
-    def configure_cisco_ios_xe(self, connection: ConnectHandler, commands: List[str]) -> Tuple[bool, str]:
+    def configure_cisco_ios_xe(self, connection: BaseConnection, commands: List[str]) -> Tuple[bool, str]:
         """Configure Cisco IOS XE switch with configure terminal revert"""
         output = ""
         try:
@@ -596,7 +597,7 @@ class SwitchConfigurator:
 
         raise ValueError(f"Unmatched {block_type} block starting at line {start_index + 1}")
 
-    def _safe_disconnect(self, connection: Optional[ConnectHandler], hostname: str) -> None:
+    def _safe_disconnect(self, connection: Optional[BaseConnection], hostname: str) -> None:
         """Safely disconnect with proper error handling and resource cleanup"""
         if connection is None:
             return
@@ -622,7 +623,7 @@ class SwitchConfigurator:
                     return response
         return None
 
-    def execute_command_with_prompts(self, connection: ConnectHandler, command: str, *, in_config_mode: bool = False) -> str:
+    def execute_command_with_prompts(self, connection: BaseConnection, command: str, *, in_config_mode: bool = False) -> str:
         """Execute a command and optionally respond to interactive prompts."""
         try:
             response = self.get_prompt_response(command)
@@ -644,7 +645,7 @@ class SwitchConfigurator:
         except Exception as e:
             raise RuntimeError(f"ERROR executing '{command}': {str(e)}") from e
 
-    def execute_configuration_batch(self, connection: ConnectHandler, commands: List[str], *, enter_config_mode: bool) -> str:
+    def execute_configuration_batch(self, connection: BaseConnection, commands: List[str], *, enter_config_mode: bool) -> str:
         """Send a batch of non-interactive configuration commands through Netmiko config mode."""
         for cmd in commands:
             thread_safe_print(f"  [dim cyan]→[/dim cyan] {cmd}")
@@ -670,7 +671,7 @@ class SwitchConfigurator:
 
         return output + "\n"
 
-    def execute_configuration_commands(self, connection: ConnectHandler, commands: List[str], *, already_in_config_mode: bool) -> str:
+    def execute_configuration_commands(self, connection: BaseConnection, commands: List[str], *, already_in_config_mode: bool) -> str:
         """Execute configuration commands in-order, batching normal lines and isolating prompt-driven ones."""
         if not commands:
             raise ValueError("No configuration commands were provided")
