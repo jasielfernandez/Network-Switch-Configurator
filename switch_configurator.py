@@ -641,7 +641,7 @@ class SwitchConfigurator:
                     cmd_verify=False,
                 )
 
-            return connection.send_command(command, expect_string=r'#')
+            return cast(str, connection.send_command(command, expect_string=r'#'))
         except Exception as e:
             raise RuntimeError(f"ERROR executing '{command}': {str(e)}") from e
 
