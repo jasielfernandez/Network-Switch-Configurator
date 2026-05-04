@@ -219,26 +219,49 @@ class SwitchConfigurator:
                                                            read_timeout=60,
                                                            expect_string=r'.*#'))
                 output += checkpoint_output + "\n"
+                thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] Checkpoint command output: {repr(checkpoint_output)}")
             except Exception as e:
                 thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to execute checkpoint auto command: {e}")
                 return False, output + f"\nERROR: {str(e)}"
 
             # Validate auto checkpoint started successfully
-            error_indicators = ['error:', 'invalid', 'failed', 'not supported', 'permission denied', 'unable to']
+            # Look for actual error patterns at line starts (more specific to avoid false positives)
+            error_patterns = [
+                ('% error', 'Command error'),
+                ('% invalid', 'Invalid command'),
+                ('% failed', 'Command failed'),
+                ('error:', 'Error message'),
+                ('not supported', 'Feature not supported'),
+                ('permission denied', 'Permission issue'),
+            ]
+
             checkpoint_lower = checkpoint_output.lower()
 
-            for indicator in error_indicators:
-                if indicator in checkpoint_lower:
-                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to start auto checkpoint mode")
-                    thread_safe_print(f"[bold yellow]Output:[/bold yellow] {checkpoint_output}")
-                    thread_safe_print(f"[bold yellow]⚠ Hint:[/bold yellow] Check user permissions and Aruba CX OS version")
-                    return False, output
+            # Check for actual errors (lines starting with error indicators)
+            for line in checkpoint_output.split('\n'):
+                line_lower = line.strip().lower()
+                for pattern, description in error_patterns:
+                    if line_lower.startswith(pattern) or (pattern in line_lower and ('error' in line_lower or '%' in line_lower)):
+                        thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to start auto checkpoint mode: {description}")
+                        thread_safe_print(f"[bold yellow]Output:[/bold yellow] {checkpoint_output}")
+                        thread_safe_print(f"[bold yellow]⚠ Hint:[/bold yellow] Check user permissions and Aruba CX OS version")
+                        return False, output
 
+            thread_safe_print("[bold green]✓ SUCCESS:[/bold green] Auto checkpoint validation passed")
             thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Auto checkpoint active - config will auto-revert in 2 minutes if not confirmed")
+            thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] About to execute {len(commands)} commands...")
+            thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] Command list: {commands[:3]}{'...' if len(commands) > 3 else ''}")
 
             # Execute commands
             thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Executing {len(commands)} commands...")
-            output += self.execute_configuration_commands(connection, commands, already_in_config_mode=False)
+            try:
+                cmd_output = self.execute_configuration_commands(connection, commands, already_in_config_mode=False)
+                output += cmd_output
+                thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] Command execution completed, output length: {len(cmd_output)} chars")
+            except Exception as e:
+                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Exception during command execution: {e}")
+                thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] Exception type: {type(e).__name__}")
+                raise
 
             # Exit config mode
             connection.exit_config_mode()
@@ -263,23 +286,36 @@ class SwitchConfigurator:
                 return False, output + f"\nERROR: {str(e)}"
 
             # Validate confirmation succeeded
-            error_indicators = ['error:', 'invalid input', 'failed', 'no checkpoint', 'does not exist']
+            # Be more specific about actual errors vs informational messages
             confirm_lower = confirm_output.lower()
+            has_error = False
+            error_hint = "Configuration may auto-revert after timer expires"
 
-            for indicator in error_indicators:
-                if indicator in confirm_lower:
-                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to confirm auto checkpoint")
-                    thread_safe_print(f"[bold yellow]Output:[/bold yellow] {confirm_output}")
+            # Check for actual error patterns
+            for line in confirm_output.split('\n'):
+                line_lower = line.strip().lower()
 
-                    # Provide specific hints based on error type
-                    if 'no checkpoint' in confirm_lower or 'does not exist' in confirm_lower:
-                        thread_safe_print(f"[bold yellow]⚠ Hint:[/bold yellow] No active checkpoint found - may have already reverted")
-                    elif 'invalid input' in confirm_lower:
-                        thread_safe_print(f"[bold yellow]⚠ Hint:[/bold yellow] Checkpoint may have already been confirmed or expired")
-                    else:
-                        thread_safe_print(f"[bold yellow]⚠ Hint:[/bold yellow] Configuration may auto-revert after timer expires")
+                # Definite errors
+                if line_lower.startswith('% error') or line_lower.startswith('% invalid'):
+                    has_error = True
+                    break
+                elif 'invalid input' in line_lower and '%' in line_lower:
+                    has_error = True
+                    error_hint = "Checkpoint may have already been confirmed or expired"
+                    break
+                elif ('no checkpoint' in line_lower or 'does not exist' in line_lower) and ('error' in line_lower or '%' in line_lower):
+                    has_error = True
+                    error_hint = "No active checkpoint found - may have already reverted"
+                    break
+                elif line_lower.startswith('error:') or line_lower.startswith('failed:'):
+                    has_error = True
+                    break
 
-                    return False, output
+            if has_error:
+                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to confirm auto checkpoint")
+                thread_safe_print(f"[bold yellow]Output:[/bold yellow] {confirm_output}")
+                thread_safe_print(f"[bold yellow]⚠ Hint:[/bold yellow] {error_hint}")
+                return False, output
 
             thread_safe_print("[bold green]✓ SUCCESS:[/bold green] Auto checkpoint confirmed - configuration saved permanently!")
             return True, output
