@@ -208,34 +208,24 @@ class SwitchConfigurator:
             return False, output + f"\nERROR: {str(e)}"
 
     def configure_aruba_cx(self, connection: BaseConnection, commands: List[str]) -> Tuple[bool, str]:
-        """Configure Aruba CX switch with checkpoint rollback protection"""
+        """Configure Aruba CX switch with checkpoint auto rollback protection"""
         output: str = ""
         try:
-            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Creating configuration checkpoint...")
-            # Create named checkpoint with 2-minute auto-revert timer
-            checkpoint_name = f"auto-rollback-{int(time.time())}"
-            checkpoint_cmd = f'checkpoint {checkpoint_name} timer 2'
-            checkpoint_output: str = cast(str, connection.send_command(checkpoint_cmd,
+            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Starting auto checkpoint mode (2-minute timer)...")
+            # Start auto checkpoint mode with 2-minute timer
+            # Creates checkpoint named AUTO<YYYYMMDDHHMMSS>
+            checkpoint_output: str = cast(str, connection.send_command('checkpoint auto 2',
                                                        read_timeout=60,
                                                        expect_string=r'.*#'))
             output += checkpoint_output + "\n"
 
-            # Validate checkpoint was created
-            error_patterns = ['error:', 'invalid', 'failed', 'not supported', 'unable to']
-            checkpoint_lower = checkpoint_output.lower()
-
-            has_error = False
-            for pattern in error_patterns:
-                if pattern in checkpoint_lower:
-                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Checkpoint creation failed")
-                    thread_safe_print(f"[bold yellow]Output:[/bold yellow] {checkpoint_output}")
-                    has_error = True
-                    break
-
-            if has_error:
+            # Validate auto checkpoint started
+            if 'error' in checkpoint_output.lower() or 'invalid' in checkpoint_output.lower():
+                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to start auto checkpoint mode")
+                thread_safe_print(f"[bold yellow]Output:[/bold yellow] {checkpoint_output}")
                 return False, output
 
-            thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Checkpoint '{checkpoint_name}' created - will auto-revert in 2 minutes if not confirmed")
+            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Auto checkpoint active - config will auto-revert in 2 minutes if not confirmed")
 
             # Execute commands
             thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Executing {len(commands)} commands...")
@@ -244,26 +234,27 @@ class SwitchConfigurator:
             # Exit config mode
             connection.exit_config_mode()
 
-            # Confirm the checkpoint to save changes permanently
+            # Confirm the auto checkpoint to save changes permanently
             thread_safe_print()
             thread_safe_print(Panel.fit(
                 "[bold green]CONFIGURATION APPLIED[/bold green]",
                 border_style="green"
             ))
-            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Confirming checkpoint to save changes...")
+            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Confirming auto checkpoint to save changes...")
 
-            confirm_output: str = cast(str, connection.send_command('checkpoint confirm',
+            # Use 'checkpoint auto confirm' to confirm the auto checkpoint
+            confirm_output: str = cast(str, connection.send_command('checkpoint auto confirm',
                                                      read_timeout=60,
                                                      expect_string=r'.*#'))
             output += confirm_output + "\n"
 
-            # Validate confirmation
+            # Validate confirmation succeeded
             if 'error' in confirm_output.lower() or 'invalid' in confirm_output.lower():
-                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to confirm checkpoint")
+                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to confirm auto checkpoint")
                 thread_safe_print(f"[bold yellow]Output:[/bold yellow] {confirm_output}")
                 return False, output
 
-            thread_safe_print(f"[bold green]✓ SUCCESS:[/bold green] Checkpoint '{checkpoint_name}' confirmed and saved!")
+            thread_safe_print("[bold green]✓ SUCCESS:[/bold green] Auto checkpoint confirmed - configuration saved permanently!")
             return True, output
 
         except Exception as e:
