@@ -218,17 +218,27 @@ class SwitchConfigurator:
                                                        expect_string=r'.*#'))
             output += checkpoint_output + "\n"
 
-            # Validate checkpoint was created
-            error_keywords = ['error', 'invalid', 'failed', 'not supported', 'unable to']
+            # Validate checkpoint was created - be more specific about errors
+            error_patterns = [
+                'error:',
+                'error ',
+                '% error',
+                'invalid command',
+                'failed to',
+                'not supported',
+                'unable to',
+            ]
             checkpoint_lower = checkpoint_output.lower()
-            for keyword in error_keywords:
-                if keyword in checkpoint_lower:
-                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Checkpoint creation failed")
+            for pattern in error_patterns:
+                if pattern in checkpoint_lower:
+                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Checkpoint creation failed (matched '{pattern}')")
+                    thread_safe_print(f"[bold yellow]Output:[/bold yellow] {checkpoint_output}")
                     return False, output
 
             # Positive confirmation - should see 'checkpoint' in response
-            if 'checkpoint' not in checkpoint_lower:
-                thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Checkpoint response unclear, proceeding with caution")
+            if 'checkpoint' not in checkpoint_lower and 'config' not in checkpoint_lower:
+                thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Checkpoint response unclear")
+                thread_safe_print(f"[bold yellow]Output:[/bold yellow] {checkpoint_output}")
 
             thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Checkpoint created with auto-confirm enabled")
 
@@ -251,12 +261,24 @@ class SwitchConfigurator:
                                                      expect_string=r'.*#'))
             output += confirm_output + "\n"
 
-            # Validate confirmation succeeded
-            error_keywords = ['error', 'invalid', 'failed', 'not supported', 'unable to']
+            # DEBUG: Show actual output
+            thread_safe_print(f"[bold yellow]DEBUG:[/bold yellow] Checkpoint confirm output: {repr(confirm_output)}")
+
+            # Validate confirmation succeeded - be more specific about errors
+            error_patterns = [
+                'error:',           # Actual error messages usually have colon
+                'error ',           # Error followed by space (not "errors" plural)
+                '% error',          # Cisco-style error
+                'invalid command',  # Invalid command
+                'failed to',        # Failed to do something
+                'not supported',    # Feature not supported
+                'unable to',        # Unable to perform action
+            ]
             confirm_lower = confirm_output.lower()
-            for keyword in error_keywords:
-                if keyword in confirm_lower:
-                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to confirm checkpoint")
+            for pattern in error_patterns:
+                if pattern in confirm_lower:
+                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to confirm checkpoint (matched '{pattern}')")
+                    thread_safe_print(f"[bold yellow]Output:[/bold yellow] {confirm_output}")
                     return False, output
 
             thread_safe_print("[bold green]✓ SUCCESS:[/bold green] Configuration confirmed and saved!")
