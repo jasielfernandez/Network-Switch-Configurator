@@ -214,16 +214,25 @@ class SwitchConfigurator:
             thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Starting auto checkpoint mode (2-minute timer)...")
             # Start auto checkpoint mode with 2-minute timer
             # Creates checkpoint named AUTO<YYYYMMDDHHMMSS>
-            checkpoint_output: str = cast(str, connection.send_command('checkpoint auto 2',
-                                                       read_timeout=60,
-                                                       expect_string=r'.*#'))
-            output += checkpoint_output + "\n"
+            try:
+                checkpoint_output: str = cast(str, connection.send_command('checkpoint auto 2',
+                                                           read_timeout=60,
+                                                           expect_string=r'.*#'))
+                output += checkpoint_output + "\n"
+            except Exception as e:
+                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to execute checkpoint auto command: {e}")
+                return False, output + f"\nERROR: {str(e)}"
 
-            # Validate auto checkpoint started
-            if 'error' in checkpoint_output.lower() or 'invalid' in checkpoint_output.lower():
-                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to start auto checkpoint mode")
-                thread_safe_print(f"[bold yellow]Output:[/bold yellow] {checkpoint_output}")
-                return False, output
+            # Validate auto checkpoint started successfully
+            error_indicators = ['error:', 'invalid', 'failed', 'not supported', 'permission denied', 'unable to']
+            checkpoint_lower = checkpoint_output.lower()
+
+            for indicator in error_indicators:
+                if indicator in checkpoint_lower:
+                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to start auto checkpoint mode")
+                    thread_safe_print(f"[bold yellow]Output:[/bold yellow] {checkpoint_output}")
+                    thread_safe_print(f"[bold yellow]⚠ Hint:[/bold yellow] Check user permissions and Aruba CX OS version")
+                    return False, output
 
             thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Auto checkpoint active - config will auto-revert in 2 minutes if not confirmed")
 
@@ -243,16 +252,34 @@ class SwitchConfigurator:
             thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Confirming auto checkpoint to save changes...")
 
             # Use 'checkpoint auto confirm' to confirm the auto checkpoint
-            confirm_output: str = cast(str, connection.send_command('checkpoint auto confirm',
-                                                     read_timeout=60,
-                                                     expect_string=r'.*#'))
-            output += confirm_output + "\n"
+            try:
+                confirm_output: str = cast(str, connection.send_command('checkpoint auto confirm',
+                                                         read_timeout=60,
+                                                         expect_string=r'.*#'))
+                output += confirm_output + "\n"
+            except Exception as e:
+                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to execute checkpoint auto confirm: {e}")
+                thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Configuration may auto-revert if timer expires")
+                return False, output + f"\nERROR: {str(e)}"
 
             # Validate confirmation succeeded
-            if 'error' in confirm_output.lower() or 'invalid' in confirm_output.lower():
-                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to confirm auto checkpoint")
-                thread_safe_print(f"[bold yellow]Output:[/bold yellow] {confirm_output}")
-                return False, output
+            error_indicators = ['error:', 'invalid input', 'failed', 'no checkpoint', 'does not exist']
+            confirm_lower = confirm_output.lower()
+
+            for indicator in error_indicators:
+                if indicator in confirm_lower:
+                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to confirm auto checkpoint")
+                    thread_safe_print(f"[bold yellow]Output:[/bold yellow] {confirm_output}")
+
+                    # Provide specific hints based on error type
+                    if 'no checkpoint' in confirm_lower or 'does not exist' in confirm_lower:
+                        thread_safe_print(f"[bold yellow]⚠ Hint:[/bold yellow] No active checkpoint found - may have already reverted")
+                    elif 'invalid input' in confirm_lower:
+                        thread_safe_print(f"[bold yellow]⚠ Hint:[/bold yellow] Checkpoint may have already been confirmed or expired")
+                    else:
+                        thread_safe_print(f"[bold yellow]⚠ Hint:[/bold yellow] Configuration may auto-revert after timer expires")
+
+                    return False, output
 
             thread_safe_print("[bold green]✓ SUCCESS:[/bold green] Auto checkpoint confirmed - configuration saved permanently!")
             return True, output

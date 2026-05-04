@@ -5,7 +5,7 @@ Automated SSH-based network switch configuration tool with built-in rollback sup
 ## Features
 
 - **Concurrent Execution**: Configure up to 10 switches simultaneously with multi-threading for fast bulk operations
-- **Automatic Rollback Protection**: Uses checkpoint auto (Aruba CX) or configure terminal revert (Cisco IOS XE) to automatically revert changes if not confirmed within 2 minutes
+- **Automatic Rollback Protection**: Uses `checkpoint auto 2` + `checkpoint auto confirm` (Aruba CX) or `configure terminal revert timer 2` (Cisco IOS XE) to automatically revert changes if not confirmed within 2 minutes
 - **Multi-Vendor Support**: Works with both Aruba CX and Cisco IOS XE switches
 - **Bulk Configuration**: Configure multiple switches from a CSV file with progress tracking
 - **Rich CLI Interface**: Beautiful colored output with tables, panels, and progress bars
@@ -104,7 +104,7 @@ Control command execution with conditional directives and loops. Directives are 
   archive
     path flash:backup
 #ELSE
-  checkpoint auto-confirm
+  logging buffered 16384
 #ENDIF
 ```
 
@@ -173,8 +173,8 @@ For CORE-SW-01 (stack=0), the entire block is skipped.
 #ENDIF
 
 #IF {vendor} == aruba
-  checkpoint auto-confirm
   logging buffered 16384
+  snmp-server contact Network Team
 #ENDIF
 ```
 
@@ -272,10 +272,15 @@ The tool uses multi-threading to configure multiple switches simultaneously:
 ### Execution Flow
 
 #### For Aruba CX Switches:
-1. Program executes `checkpoint auto confirm` to enable auto-confirmation
+1. **Auto checkpoint setup** (automatic):
+   - Program executes `checkpoint auto 2` to create auto checkpoint with 2-minute timer
+   - Creates checkpoint named `AUTO<YYYYMMDDHHMMSS>` 
+   - If not confirmed within 2 minutes, configuration automatically reverts
 2. Commands are executed in configuration mode with variable substitution
-3. Configuration is automatically confirmed with `checkpoint confirm`
-4. Changes are saved to the switch
+3. Configuration is confirmed with `checkpoint auto confirm` to save permanently
+4. Changes are committed to the switch
+
+**Important:** The checkpoint must be confirmed within 2 minutes or all changes automatically revert to previous state.
 
 #### For Cisco IOS XE Switches:
 1. **Archive check and setup** (automatic if needed):
@@ -325,7 +330,17 @@ write memory
 
 #### Aruba CX Checkpoint Feature
 
-Aruba CX switches have checkpoint functionality built-in and require no additional configuration. The `checkpoint auto confirm` command works out of the box.
+Aruba CX switches have checkpoint functionality built-in and require no additional configuration. The script uses:
+- `checkpoint auto 2` - Creates auto checkpoint with 2-minute timer
+- `checkpoint auto confirm` - Confirms and saves changes permanently
+
+**How it works:**
+1. Auto checkpoint creates a restore point named `AUTO<YYYYMMDDHHMMSS>`
+2. You have 2 minutes to apply changes and confirm
+3. If `checkpoint auto confirm` is not executed within 2 minutes, configuration automatically reverts
+4. Upon confirmation, changes are saved permanently to the running configuration
+
+**No manual setup required** - checkpoint commands work out of the box on Aruba CX OS.
 
 ## Example Session
 
@@ -359,8 +374,8 @@ Connecting to aruba-switch-01 (192.168.1.10) - OS: aruba_cx
 ============================================================
 [INFO] Establishing SSH connection...
 [SUCCESS] Connected to aruba-switch-01
-[INFO] Setting up checkpoint with 2-minute auto-revert...
-[INFO] Checkpoint created - configuration will auto-revert in 2 minutes if not confirmed
+[INFO] Starting auto checkpoint mode (2-minute timer)...
+[INFO] Auto checkpoint active - config will auto-revert in 2 minutes if not confirmed
 [INFO] Executing 5 commands...
   -> vlan 100
   -> name VLAN_100_Data
@@ -369,8 +384,8 @@ Connecting to aruba-switch-01 (192.168.1.10) - OS: aruba_cx
 ============================================================
 CONFIGURATION APPLIED
 ============================================================
-[INFO] Auto-confirming configuration changes...
-[SUCCESS] Configuration confirmed and saved!
+[INFO] Confirming auto checkpoint to save changes...
+[SUCCESS] Auto checkpoint confirmed - configuration saved permanently!
 [INFO] Disconnected from aruba-switch-01
 
 ============================================================
@@ -443,6 +458,49 @@ If you see errors related to archive or revert timer on Cisco switches:
    Should display configured path and maximum files.
 
 **Note:** Archive is automatically configured by the script on first run and persists across reboots.
+
+### Checkpoint Issues (Aruba CX)
+
+If you see errors related to checkpoint commands on Aruba switches:
+
+**Symptom:** Configuration applied but not saved, or "Invalid input" errors
+
+**Common Causes:**
+1. **Checkpoint not confirmed in time** - Auto checkpoint reverted after 2-minute timer expired
+2. **No active checkpoint** - Trying to confirm when no checkpoint exists
+3. **Insufficient permissions** - User account doesn't have checkpoint privileges
+
+**Solutions:**
+
+1. **Verify checkpoint was created:**
+   ```
+   show checkpoint
+   ```
+   Should show an `AUTO<timestamp>` checkpoint in the list
+
+2. **Check user permissions:**
+   - User must have admin or operator privileges
+   - Verify with: `show running-config | include user`
+
+3. **Monitor checkpoint status in accounting logs:**
+   ```
+   show logging | include checkpoint
+   ```
+   Should show both `checkpoint auto 2` and `checkpoint auto confirm` commands
+
+4. **Manual checkpoint workflow (if auto fails):**
+   ```
+   checkpoint my-checkpoint
+   <make configuration changes>
+   checkpoint confirm
+   ```
+
+**Note:** If configuration reverts automatically, you'll see a message like:
+```
+Reverting to checkpoint AUTO20260504091500
+```
+
+This means the 2-minute timer expired before `checkpoint auto confirm` was executed.
 
 ## Security Recommendations
 
