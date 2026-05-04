@@ -155,7 +155,7 @@ class SwitchConfigurator:
         Returns: (is_configured, error_message)
         """
         try:
-            output = connection.send_command('show archive', read_timeout=30)
+            output: str = connection.send_command('show archive', read_timeout=30)
             # If archive is configured, output will show path
             if 'flash:' in output.lower() or 'bootflash:' in output.lower():
                 return True, ""
@@ -165,7 +165,7 @@ class SwitchConfigurator:
 
     def setup_archive(self, connection: BaseConnection) -> Tuple[bool, str]:
         """Configure archive on Cisco device if not already set up"""
-        output = ""
+        output: str = ""
         try:
             thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Configuring archive for rollback support...")
 
@@ -179,7 +179,7 @@ class SwitchConfigurator:
             ]
 
             for cmd in archive_commands:
-                cmd_output = connection.send_command(cmd, expect_string=r'#')
+                cmd_output: str = connection.send_command(cmd, expect_string=r'#')
                 output += cmd_output + "\n"
 
                 # Validate each command succeeded
@@ -188,7 +188,7 @@ class SwitchConfigurator:
                     return False, output + f"\nERROR: Command '{cmd}' failed"
 
             # Save the archive configuration
-            save_output = connection.send_command('write memory', expect_string=r'#')
+            save_output: str = connection.send_command('write memory', expect_string=r'#')
             output += save_output + "\n"
 
             if 'error' in save_output.lower() or not ('[OK]' in save_output or 'Building configuration' in save_output):
@@ -196,7 +196,7 @@ class SwitchConfigurator:
                 return False, output + "\nERROR: Failed to save configuration"
 
             # Verify archive was actually configured
-            verify_output = connection.send_command('show archive')
+            verify_output: str = connection.send_command('show archive')
             if 'flash:' not in verify_output.lower() and 'bootflash:' not in verify_output.lower():
                 thread_safe_print("[bold red]✗ ERROR:[/bold red] Archive setup failed validation")
                 return False, output + "\nERROR: Archive not configured after setup"
@@ -209,11 +209,11 @@ class SwitchConfigurator:
 
     def configure_aruba_cx(self, connection: BaseConnection, commands: List[str]) -> Tuple[bool, str]:
         """Configure Aruba CX switch with checkpoint auto confirm"""
-        output = ""
+        output: str = ""
         try:
             thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Setting up checkpoint with auto-confirm...")
             # Create checkpoint with auto-confirm (use timing mode for better compatibility)
-            checkpoint_output = connection.send_command('checkpoint auto confirm',
+            checkpoint_output: str = connection.send_command('checkpoint auto confirm',
                                                        read_timeout=60,
                                                        expect_string=r'.*#')
             output += checkpoint_output + "\n"
@@ -246,7 +246,7 @@ class SwitchConfigurator:
                 border_style="green"
             ))
             thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Auto-confirming configuration changes...")
-            confirm_output = connection.send_command('checkpoint confirm',
+            confirm_output: str = connection.send_command('checkpoint confirm',
                                                      read_timeout=60,
                                                      expect_string=r'.*#')
             output += confirm_output + "\n"
@@ -269,7 +269,7 @@ class SwitchConfigurator:
 
     def configure_cisco_ios_xe(self, connection: BaseConnection, commands: List[str]) -> Tuple[bool, str]:
         """Configure Cisco IOS XE switch with configure terminal revert"""
-        output = ""
+        output: str = ""
         try:
             # Check if archive is configured
             is_configured, error_msg = self.check_archive_configured(connection)
@@ -288,7 +288,7 @@ class SwitchConfigurator:
 
             thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Entering configuration mode with revert timer (2 minutes)...")
             # Enter config mode with revert timer
-            revert_output = connection.send_command('configure terminal revert timer 2', expect_string=r'#')
+            revert_output: str = connection.send_command('configure terminal revert timer 2', expect_string=r'#')
             output += revert_output + "\n"
 
             # Validate that revert timer was accepted
@@ -315,7 +315,7 @@ class SwitchConfigurator:
                 border_style="green"
             ))
             thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Auto-confirming configuration changes...")
-            confirm_output = connection.send_command('configure confirm')
+            confirm_output: str = connection.send_command('configure confirm')
             output += confirm_output + "\n"
 
             # Validate confirmation succeeded
@@ -324,7 +324,7 @@ class SwitchConfigurator:
                 return False, output
 
             # Save configuration
-            save_output = connection.send_command('write memory', expect_string=r'#')
+            save_output: str = connection.send_command('write memory', expect_string=r'#')
             output += save_output + "\n"
 
             # Validate save succeeded
@@ -628,7 +628,7 @@ class SwitchConfigurator:
         try:
             response = self.get_prompt_response(command)
             if response is not None:
-                output = connection.send_command_timing(command)
+                output: str = connection.send_command_timing(command)
                 if any(p in output.lower() for p in ['[y/n]', '(y/n)', 'confirm', '[yes/no]']):
                     output += connection.send_command_timing(response)
                 return output
@@ -650,7 +650,7 @@ class SwitchConfigurator:
         for cmd in commands:
             thread_safe_print(f"  [dim cyan]→[/dim cyan] {cmd}")
 
-        output = connection.send_config_set(
+        output: str = connection.send_config_set(
             commands,
             enter_config_mode=enter_config_mode,
             exit_config_mode=False,
