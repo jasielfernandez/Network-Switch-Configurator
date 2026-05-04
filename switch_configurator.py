@@ -746,6 +746,7 @@ class SwitchConfigurator:
 
         device_type = self.get_device_type(os_type)
 
+        # Build device connection parameters
         device = {
             'device_type': device_type,
             'host': ip_address,
@@ -756,6 +757,10 @@ class SwitchConfigurator:
             'global_delay_factor': 2, # Slow down for device compatibility
             'fast_cli': False,        # Disable fast CLI to avoid prompt detection issues
         }
+
+        # Aruba CX switches don't use 'enable' command - prevent netmiko from sending it
+        if 'aruba' in os_type:
+            device['secret'] = ''  # Disable enable mode for Aruba
 
         connection = None
         try:
