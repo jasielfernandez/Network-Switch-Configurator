@@ -246,42 +246,21 @@ class SwitchConfigurator:
             thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Executing {len(commands)} commands...")
             output += self.execute_configuration_commands(connection, commands, already_in_config_mode=False)
 
-            # Exit config mode before confirming checkpoint
+            # Exit config mode
             connection.exit_config_mode()
 
-            # Automatically confirm changes
+            # Configuration applied with auto-confirm
             thread_safe_print()
             thread_safe_print(Panel.fit(
                 "[bold green]CONFIGURATION APPLIED[/bold green]",
                 border_style="green"
             ))
-            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Auto-confirming configuration changes...")
-            confirm_output: str = cast(str, connection.send_command('checkpoint confirm',
-                                                     read_timeout=60,
-                                                     expect_string=r'.*#'))
-            output += confirm_output + "\n"
 
-            # DEBUG: Show actual output
-            thread_safe_print(f"[bold yellow]DEBUG:[/bold yellow] Checkpoint confirm output: {repr(confirm_output)}")
+            # With auto-confirm, the checkpoint is automatically saved after timer expires
+            # No need to manually confirm - it happens automatically
+            thread_safe_print("[bold green]✓ SUCCESS:[/bold green] Configuration will be auto-confirmed")
+            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Checkpoint auto-confirm active (changes saved automatically)")
 
-            # Validate confirmation succeeded - be more specific about errors
-            error_patterns = [
-                'error:',           # Actual error messages usually have colon
-                'error ',           # Error followed by space (not "errors" plural)
-                '% error',          # Cisco-style error
-                'invalid command',  # Invalid command
-                'failed to',        # Failed to do something
-                'not supported',    # Feature not supported
-                'unable to',        # Unable to perform action
-            ]
-            confirm_lower = confirm_output.lower()
-            for pattern in error_patterns:
-                if pattern in confirm_lower:
-                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to confirm checkpoint (matched '{pattern}')")
-                    thread_safe_print(f"[bold yellow]Output:[/bold yellow] {confirm_output}")
-                    return False, output
-
-            thread_safe_print("[bold green]✓ SUCCESS:[/bold green] Configuration confirmed and saved!")
             return True, output
 
         except Exception as e:
