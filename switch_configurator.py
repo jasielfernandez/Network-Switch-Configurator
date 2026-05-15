@@ -954,7 +954,7 @@ def main():
                         'success': False
                     })
                 except Exception as e:
-                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Unexpected error for {switch.get('switchname', 'unknown')}: {e}")
+                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Unexpected error for {switch.get('switchname', 'unknown')}: {str(e)!r}")
                     results.append({
                         'hostname': switch.get('switchname', 'unknown'),
                         'ip': switch.get('ip address', 'unknown'),
@@ -1017,5 +1017,5 @@ if __name__ == '__main__':
         console.print("\n[bold cyan]⚙ INFO:[/bold cyan] Configuration cancelled by user (Ctrl+C)")
         sys.exit(0)
     except Exception as e:
-        console.print(f"\n[bold red]✗ ERROR:[/bold red] Unexpected error: {e}")
+        console.print(f"\n[bold red]✗ ERROR:[/bold red] Unexpected error: {str(e)!r}")
         sys.exit(1)
