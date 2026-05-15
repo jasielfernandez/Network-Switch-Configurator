@@ -156,7 +156,7 @@ class SwitchConfigurator:
         Returns: (is_configured, error_message)
         """
         try:
-            output: str = cast(str, connection.send_command('show archive', read_timeout=30))
+            output: str = cast(str, connection.send_command('show archive', read_timeout=60))
             # If archive is configured, output will show path
             if 'flash:' in output.lower() or 'bootflash:' in output.lower():
                 return True, ""
@@ -217,7 +217,7 @@ class SwitchConfigurator:
             # Creates checkpoint named AUTO<YYYYMMDDHHMMSS>
             try:
                 checkpoint_output: str = cast(str, connection.send_command('checkpoint auto 2',
-                                                           read_timeout=60,
+                                                           read_timeout=120,
                                                            expect_string=r'.*#'))
                 output += checkpoint_output + "\n"
                 thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] Checkpoint command output: {escape(checkpoint_output)}")
@@ -278,7 +278,7 @@ class SwitchConfigurator:
             # Use 'checkpoint auto confirm' to confirm the auto checkpoint
             try:
                 confirm_output: str = cast(str, connection.send_command('checkpoint auto confirm',
-                                                         read_timeout=60,
+                                                         read_timeout=120,
                                                          expect_string=r'.*#'))
                 output += confirm_output + "\n"
             except Exception as e:
@@ -714,7 +714,7 @@ class SwitchConfigurator:
             enter_config_mode=enter_config_mode,
             exit_config_mode=False,
             cmd_verify=False,  # Keep for performance, check output manually
-            read_timeout=120,  # Increased timeout for slow devices
+            read_timeout=240,  # Extended timeout for TACACS+ authorization delays and slow devices
         ))
 
         # Check output for common error indicators
