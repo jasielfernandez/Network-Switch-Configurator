@@ -19,6 +19,7 @@ from rich.table import Table
 from rich.prompt import Prompt, Confirm
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 from rich.style import Style
+from rich.markup import escape
 from rich import box
 
 # Initialize thread-safe rich console
@@ -954,7 +955,7 @@ def main():
                         'success': False
                     })
                 except Exception as e:
-                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Unexpected error for {switch.get('switchname', 'unknown')}: {str(e)!r}")
+                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Unexpected error for {switch.get('switchname', 'unknown')}: {escape(str(e))}")
                     results.append({
                         'hostname': switch.get('switchname', 'unknown'),
                         'ip': switch.get('ip address', 'unknown'),
@@ -1017,5 +1018,5 @@ if __name__ == '__main__':
         console.print("\n[bold cyan]⚙ INFO:[/bold cyan] Configuration cancelled by user (Ctrl+C)")
         sys.exit(0)
     except Exception as e:
-        console.print(f"\n[bold red]✗ ERROR:[/bold red] Unexpected error: {str(e)!r}")
+        console.print(f"\n[bold red]✗ ERROR:[/bold red] Unexpected error: {escape(str(e))}")
         sys.exit(1)
