@@ -205,7 +205,7 @@ class SwitchConfigurator:
             thread_safe_print("[bold green]✓ SUCCESS:[/bold green] Archive configured successfully")
             return True, output
         except Exception as e:
-            thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to configure archive: {e}")
+            thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to configure archive: {escape(str(e))}")
             return False, output + f"\nERROR: {str(e)}"
 
     def configure_aruba_cx(self, connection: BaseConnection, commands: List[str]) -> Tuple[bool, str]:
@@ -220,9 +220,9 @@ class SwitchConfigurator:
                                                            read_timeout=60,
                                                            expect_string=r'.*#'))
                 output += checkpoint_output + "\n"
-                thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] Checkpoint command output: {repr(checkpoint_output)}")
+                thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] Checkpoint command output: {escape(checkpoint_output)}")
             except Exception as e:
-                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to execute checkpoint auto command: {e}")
+                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to execute checkpoint auto command: {escape(str(e))}")
                 return False, output + f"\nERROR: {str(e)}"
 
             # Validate auto checkpoint started successfully
@@ -244,7 +244,7 @@ class SwitchConfigurator:
                 for pattern, description in error_patterns:
                     if line_lower.startswith(pattern) or (pattern in line_lower and ('error' in line_lower or '%' in line_lower)):
                         thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to start auto checkpoint mode: {description}")
-                        thread_safe_print(f"[bold yellow]Output:[/bold yellow] {checkpoint_output}")
+                        thread_safe_print(f"[bold yellow]Output:[/bold yellow] {escape(checkpoint_output)}")
                         thread_safe_print(f"[bold yellow]⚠ Hint:[/bold yellow] Check user permissions and Aruba CX OS version")
                         return False, output
 
@@ -260,7 +260,7 @@ class SwitchConfigurator:
                 output += cmd_output
                 thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] Command execution completed, output length: {len(cmd_output)} chars")
             except Exception as e:
-                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Exception during command execution: {e}")
+                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Exception during command execution: {escape(str(e))}")
                 thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] Exception type: {type(e).__name__}")
                 raise
 
@@ -282,7 +282,7 @@ class SwitchConfigurator:
                                                          expect_string=r'.*#'))
                 output += confirm_output + "\n"
             except Exception as e:
-                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to execute checkpoint auto confirm: {e}")
+                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to execute checkpoint auto confirm: {escape(str(e))}")
                 thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Configuration may auto-revert if timer expires")
                 return False, output + f"\nERROR: {str(e)}"
 
@@ -314,7 +314,7 @@ class SwitchConfigurator:
 
             if has_error:
                 thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to confirm auto checkpoint")
-                thread_safe_print(f"[bold yellow]Output:[/bold yellow] {confirm_output}")
+                thread_safe_print(f"[bold yellow]Output:[/bold yellow] {escape(confirm_output)}")
                 thread_safe_print(f"[bold yellow]⚠ Hint:[/bold yellow] {error_hint}")
                 return False, output
 
@@ -322,7 +322,7 @@ class SwitchConfigurator:
             return True, output
 
         except Exception as e:
-            thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed during Aruba CX configuration: {e}")
+            thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed during Aruba CX configuration: {escape(str(e))}")
             thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Checkpoint will auto-revert if active...")
             return False, output + f"\nERROR: {str(e)}"
 
@@ -333,7 +333,7 @@ class SwitchConfigurator:
             # Check if archive is configured
             is_configured, error_msg = self.check_archive_configured(connection)
             if error_msg and "Failed to check" in error_msg:
-                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Cannot verify archive status: {error_msg}")
+                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Cannot verify archive status: {escape(error_msg)}")
                 return False, output + f"\nERROR: {error_msg}"
             elif not is_configured:
                 thread_safe_print("[bold yellow]⚠ WARNING:[/bold yellow] Archive not configured, setting up now...")
@@ -395,7 +395,7 @@ class SwitchConfigurator:
             return True, output
 
         except Exception as e:
-            thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed during Cisco IOS XE configuration: {e}")
+            thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed during Cisco IOS XE configuration: {escape(str(e))}")
             thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Configuration will auto-revert if active...")
             return False, output + f"\nERROR: {str(e)}"
 
@@ -410,7 +410,7 @@ class SwitchConfigurator:
                 substituted.append(substituted_cmd)
             except KeyError as e:
                 # If a variable is missing, keep the command as-is and warn
-                thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Variable {e} not found in CSV for command: {cmd}")
+                thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Variable {escape(str(e))} not found in CSV for command: {escape(cmd)}")
                 substituted.append(cmd)
         return substituted
 
@@ -493,7 +493,7 @@ class SwitchConfigurator:
                     continue
 
                 except Exception as e:
-                    thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Error parsing FOR loop: {e}")
+                    thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Error parsing FOR loop: {escape(str(e))}")
                     i += 1
                     continue
 
@@ -528,7 +528,7 @@ class SwitchConfigurator:
             else:
                 return self._evaluate_and_condition(condition, switch)
         except Exception as e:
-            thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Error evaluating condition '{condition}': {e}")
+            thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Error evaluating condition '{escape(condition)}': {escape(str(e))}")
             return False
 
     def _evaluate_and_condition(self, condition: str, switch: Dict) -> bool:
@@ -665,7 +665,7 @@ class SwitchConfigurator:
             connection.disconnect()
             thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Disconnected from {hostname}")
         except Exception as e:
-            thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Error disconnecting from {hostname}: {e}")
+            thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Error disconnecting from {hostname}: {escape(str(e))}")
             # Force close the socket if disconnect fails
             try:
                 if hasattr(connection, 'remote_conn') and connection.remote_conn:
@@ -814,7 +814,7 @@ class SwitchConfigurator:
             try:
                 parsed_commands = self.parse_commands_with_conditionals(commands_copy, switch)
             except ValueError as e:
-                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Conditional parsing failed for {hostname}: {e}")
+                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Conditional parsing failed for {hostname}: {escape(str(e))}")
                 thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Falling back to commands without conditionals")
                 # Fallback: use original commands without conditional parsing (filter out directives)
                 parsed_commands = [cmd for cmd in commands_copy if not cmd.startswith('#')]
@@ -847,7 +847,7 @@ class SwitchConfigurator:
             self._safe_disconnect(connection, hostname)
             return False
         except Exception as e:
-            thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to configure {hostname}: {e}")
+            thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to configure {hostname}: {escape(str(e))}")
             self._safe_disconnect(connection, hostname)
             return False
 
