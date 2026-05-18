@@ -472,6 +472,7 @@ class SwitchConfigurator:
 
                     count_expr = for_parts[1].strip()
                     count = self._get_loop_count(count_expr, switch)
+                    thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] FOR loop will iterate {count} times (variable: {var_name}, expression: {count_expr})")
 
                     block_end = self._find_block_end(commands, i, 'FOR')[0]
                     loop_block = commands[i+1:block_end]
@@ -813,6 +814,10 @@ class SwitchConfigurator:
 
             try:
                 parsed_commands = self.parse_commands_with_conditionals(commands_copy, switch)
+                thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] Parsed {len(parsed_commands)} commands after conditional processing")
+                if len(parsed_commands) <= 10:
+                    for idx, cmd in enumerate(parsed_commands, 1):
+                        thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan]   {idx}. {escape(cmd)}")
             except ValueError as e:
                 thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Conditional parsing failed for {hostname}: {escape(str(e))}")
                 thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Falling back to commands without conditionals")
