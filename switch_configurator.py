@@ -42,9 +42,10 @@ def thread_safe_print(*args, **kwargs):
 class SwitchConfigurator:
     """Handles SSH connections and configuration for network switches"""
 
-    def __init__(self, username: str, password: str):
+    def __init__(self, username: str, password: str, rollback_timer: int = 2):
         self.username = username
         self.password = password
+        self.rollback_timer = rollback_timer  # Timer in minutes for automatic rollback
         self.commands = []
         self.prompt_handlers = {}
         self._commands_lock = threading.RLock()
@@ -212,11 +213,11 @@ class SwitchConfigurator:
         """Configure Aruba CX switch with checkpoint auto rollback protection"""
         output: str = ""
         try:
-            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Starting auto checkpoint mode (2-minute timer)...")
-            # Start auto checkpoint mode with 2-minute timer
+            thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Starting auto checkpoint mode ({self.rollback_timer}-minute timer)...")
+            # Start auto checkpoint mode with configurable timer
             # Creates checkpoint named AUTO<YYYYMMDDHHMMSS>
             try:
-                checkpoint_output: str = cast(str, connection.send_command('checkpoint auto 2',
+                checkpoint_output: str = cast(str, connection.send_command(f'checkpoint auto {self.rollback_timer}',
                                                            read_timeout=120,
                                                            expect_string=r'.*#'))
                 output += checkpoint_output + "\n"
@@ -249,7 +250,7 @@ class SwitchConfigurator:
                         return False, output
 
             thread_safe_print("[bold green]✓ SUCCESS:[/bold green] Auto checkpoint validation passed")
-            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Auto checkpoint active - config will auto-revert in 2 minutes if not confirmed")
+            thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Auto checkpoint active - config will auto-revert in {self.rollback_timer} minutes if not confirmed")
             thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] About to execute {len(commands)} commands...")
             thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] Command list: {commands[:3]}{'...' if len(commands) > 3 else ''}")
 
@@ -345,9 +346,9 @@ class SwitchConfigurator:
             else:
                 thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Archive already configured")
 
-            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Entering configuration mode with revert timer (2 minutes)...")
+            thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Entering configuration mode with revert timer ({self.rollback_timer} minutes)...")
             # Enter config mode with revert timer
-            revert_output: str = cast(str, connection.send_command('configure terminal revert timer 2', expect_string=r'#'))
+            revert_output: str = cast(str, connection.send_command(f'configure terminal revert timer {self.rollback_timer}', expect_string=r'#'))
             output += revert_output + "\n"
 
             # Validate that revert timer was accepted
@@ -358,7 +359,7 @@ class SwitchConfigurator:
                     thread_safe_print("[bold red]✗ ERROR:[/bold red] Failed to enter revert mode - archive may not be properly configured")
                     return False, output
 
-            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Configuration mode entered - will auto-revert in 2 minutes if not confirmed")
+            thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Configuration mode entered - will auto-revert in {self.rollback_timer} minutes if not confirmed")
 
             # Execute commands
             thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Executing {len(commands)} commands...")
@@ -879,8 +880,24 @@ def main():
         console.print("[bold red]✗ ERROR:[/bold red] Password cannot be empty")
         sys.exit(1)
 
+    # Get rollback timer
+    console.print()
+    rollback_timer_str = Prompt.ask(
+        "[cyan]Rollback timer in minutes[/cyan] [dim](time before auto-revert)[/dim]",
+        default="2"
+    ).strip()
+
+    try:
+        rollback_timer = int(rollback_timer_str)
+        if rollback_timer < 1 or rollback_timer > 60:
+            console.print("[bold red]✗ ERROR:[/bold red] Rollback timer must be between 1 and 60 minutes")
+            sys.exit(1)
+    except ValueError:
+        console.print("[bold red]✗ ERROR:[/bold red] Rollback timer must be a valid number")
+        sys.exit(1)
+
     # Initialize configurator
-    configurator = SwitchConfigurator(username, password)
+    configurator = SwitchConfigurator(username, password, rollback_timer)
 
     # Load files
     console.print("\n[bold]Loading configuration files...[/bold]")
@@ -904,6 +921,7 @@ def main():
     summary_table.add_row("Switches to configure", str(len(switches)))
     summary_table.add_row("Commands to execute", str(len(commands)))
     summary_table.add_row("Prompt handlers", str(len(configurator.prompt_handlers)))
+    summary_table.add_row("Rollback timer", f"{rollback_timer} minutes")
     console.print(summary_table)
 
     # Confirm before proceeding
