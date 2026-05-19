@@ -4,27 +4,57 @@ Network Switch Configurator
 Automates SSH configuration with automatic rollback support for Aruba CX and Cisco IOS XE
 """
 
+from __future__ import annotations
+
 import csv
-import getpass
+import logging
+from pathlib import Path
 import sys
-import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
-from typing import List, Dict, Tuple, Optional, cast
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any, Callable, List, Dict, Mapping, Sequence, Tuple, Optional, Union, cast
 from netmiko import ConnectHandler, NetmikoTimeoutException, NetmikoAuthenticationException
 from netmiko.base_connection import BaseConnection
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
-from rich.prompt import Prompt, Confirm
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
-from rich.style import Style
-from rich.markup import escape
-from rich import box
+from textual.app import App, ComposeResult
+from textual.containers import Container, Horizontal, Vertical, VerticalScroll
+from textual.widgets import Button, DataTable, Footer, Header, Input, Log, ProgressBar, Static
 
-# Initialize thread-safe rich console
-console = Console()
-console_lock = threading.Lock()
+status_lock = threading.Lock()
+_status_callback: Optional[Callable[["StatusEvent"], None]] = None
+
+# File-only logging. Operator-facing status stays in the Textual UI; diagnostics
+# and raw device output go to this single log file.
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+LOG_FILE = LOG_DIR / "switch_configurator.log"
+
+
+def setup_logging() -> logging.Logger:
+    """Configure the application logger to write diagnostics to one file."""
+    LOG_DIR.mkdir(exist_ok=True)
+
+    app_logger = logging.getLogger("switch_configurator")
+    app_logger.setLevel(logging.DEBUG)
+    app_logger.propagate = False
+
+    for handler in list(app_logger.handlers):
+        if isinstance(handler, logging.NullHandler):
+            app_logger.removeHandler(handler)
+
+    if not any(isinstance(handler, logging.FileHandler) for handler in app_logger.handlers):
+        file_handler = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s [%(threadName)s] %(message)s"
+        ))
+        app_logger.addHandler(file_handler)
+
+    return app_logger
+
+
+logger = logging.getLogger("switch_configurator")
+logger.addHandler(logging.NullHandler())
 
 # Maximum iterations allowed in FOR loops to prevent memory exhaustion
 MAX_LOOP_ITERATIONS = 10000
@@ -32,11 +62,193 @@ MAX_LOOP_ITERATIONS = 10000
 # Maximum time (in seconds) to wait for a single switch configuration
 THREAD_TIMEOUT = 600  # 10 minutes per switch
 
+# The UI uses the cross-platform timer range. Cisco IOS XE supports up to 120
+# minutes, but Aruba AOS-CX checkpoint auto is documented at 1-60 minutes.
+ROLLBACK_TIMER_MIN = 1
+ROLLBACK_TIMER_MAX = 60
+
+# Common command output errors caught after Netmiko command execution
+ERROR_INDICATORS = (
+    "% invalid",
+    "% incomplete",
+    "% error",
+    "% unknown command",
+    "command not found",
+    "syntax error",
+)
+
+
+class ConfigError(Exception):
+    """Raised when local configuration files or CLI inputs are invalid."""
+
+
+class CommandSyntaxError(ConfigError):
+    """Raised when commands.txt contains invalid conditional syntax."""
+
+
+class DeviceExecutionError(Exception):
+    """Raised when device command output indicates a failed operation."""
+
+
+@dataclass(frozen=True)
+class SwitchRecord:
+    """Normalized switch inventory row while preserving extra CSV fields."""
+
+    switchname: str
+    ip_address: str
+    vendor: str
+    fields: Mapping[str, str]
+
+    @classmethod
+    def from_mapping(cls, row: Mapping[str, Any]) -> "SwitchRecord":
+        fields = {str(key): "" if value is None else str(value) for key, value in row.items()}
+        return cls(
+            switchname=fields.get("switchname", "unknown"),
+            ip_address=fields.get("ip address", ""),
+            vendor=fields.get("vendor", "cisco"),
+            fields=MappingProxyType(fields),
+        )
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.fields.get(key, default)
+
+    def to_context(self) -> Dict[str, str]:
+        return dict(self.fields)
+
+
+@dataclass(frozen=True)
+class RunConfig:
+    """Runtime settings for a single CLI execution."""
+
+    username: str
+    password: str
+    rollback_timer: int
+    max_workers: int = 10
+    switches_file: str = "switches.csv"
+    commands_file: str = "commands.txt"
+    prompt_file: str = "prompthandling.txt"
+
+
+@dataclass(frozen=True)
+class SwitchResult:
+    """Final status for one switch configuration attempt."""
+
+    hostname: str
+    ip: str
+    vendor: str
+    success: bool
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class StatusEvent:
+    """Concise operator-facing status message."""
+
+    message: str
+    level: str = "info"
+    switch: str = ""
+
+
+@dataclass(frozen=True)
+class TextCommand:
+    text: str
+
+
+@dataclass(frozen=True)
+class IfBlock:
+    condition: str
+    if_body: Tuple["CommandNode", ...]
+    else_body: Tuple["CommandNode", ...] = ()
+
+
+@dataclass(frozen=True)
+class ForBlock:
+    variable: str
+    count_expr: str
+    body: Tuple["CommandNode", ...]
+
+
+CommandNode = Union[TextCommand, IfBlock, ForBlock]
+
+
+def set_status_callback(callback: Optional[Callable[[StatusEvent], None]]) -> None:
+    """Set a process-wide status callback used by worker threads."""
+    global _status_callback
+    with status_lock:
+        _status_callback = callback
+
+
+def strip_markup(value: Any) -> str:
+    """Convert legacy markup-heavy messages into plain status text."""
+    return str(value).strip()
+
+
+def infer_status_level(message: str) -> str:
+    lowered = message.lower()
+    if "error" in lowered or "fail" in lowered:
+        return "error"
+    if "warning" in lowered:
+        return "warning"
+    if "success" in lowered or " ok" in lowered:
+        return "success"
+    return "info"
+
 
 def thread_safe_print(*args, **kwargs):
-    """Thread-safe wrapper for console.print"""
-    with console_lock:
-        console.print(*args, **kwargs)
+    """Compatibility status emitter used by worker code; does not print."""
+    message = " ".join(strip_markup(arg) for arg in args if str(arg).strip())
+    if not message:
+        return
+    event = StatusEvent(message=message, level=infer_status_level(message))
+    logger.info("%s", message)
+    with status_lock:
+        callback = _status_callback
+    if callback:
+        callback(event)
+
+
+def log_device_output(context: str, output: str) -> None:
+    """Write raw device output to the log file without printing it."""
+    if output:
+        logger.debug("%s output:\n%s", context, output.rstrip())
+    else:
+        logger.debug("%s output: <empty>", context)
+
+
+def find_error_line(output: str, indicators: Sequence[str] = ERROR_INDICATORS) -> Optional[str]:
+    """Return the first line that matches a known device error indicator."""
+    output_lower = output.lower()
+    for indicator in indicators:
+        if indicator in output_lower:
+            for line in output.splitlines():
+                if indicator in line.lower():
+                    return line.strip()
+            return indicator
+    return None
+
+
+def validate_no_command_errors(output: str, context: str) -> None:
+    """Raise if device output contains a known command error."""
+    error_line = find_error_line(output)
+    if error_line:
+        raise DeviceExecutionError(f"{context} failed: {error_line}")
+
+
+def output_indicates_save_success(output: str) -> bool:
+    """Return whether Cisco-style save output indicates success."""
+    return "[OK]" in output or "Building configuration" in output
+
+
+def switch_result_from_record(switch: Union[SwitchRecord, Mapping[str, Any]], success: bool, error: str = "") -> SwitchResult:
+    """Build a SwitchResult from either a normalized record or a CSV row mapping."""
+    record = switch if isinstance(switch, SwitchRecord) else SwitchRecord.from_mapping(switch)
+    return SwitchResult(
+        hostname=record.switchname,
+        ip=record.ip_address,
+        vendor=record.vendor,
+        success=success,
+        error=error,
+    )
 
 
 class SwitchConfigurator:
@@ -46,40 +258,39 @@ class SwitchConfigurator:
         self.username = username
         self.password = password
         self.rollback_timer = rollback_timer  # Timer in minutes for automatic rollback
-        self.commands = []
-        self.prompt_handlers = {}
-        self._commands_lock = threading.RLock()
-        self._handlers_lock = threading.RLock()
+        self.commands: Tuple[str, ...] = ()
+        self.command_template: Tuple[CommandNode, ...] = ()
+        self.prompt_handlers: Mapping[str, str] = MappingProxyType({})
 
-    def load_switches(self, csv_file: str) -> List[Dict]:
+    def load_switches(self, csv_file: str) -> List[SwitchRecord]:
         """Load switch information from CSV file"""
-        switches = []
+        switches: List[SwitchRecord] = []
         required_columns = {'switchname', 'ip address', 'vendor'}
         try:
             with open(csv_file, 'r', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 # Validate required columns exist
-                if reader.fieldnames:
-                    missing = required_columns - set(reader.fieldnames)
-                    if missing:
-                        console.print(f"[bold red]✗ ERROR:[/bold red] Missing required columns in {csv_file}: {', '.join(missing)}")
-                        sys.exit(1)
+                if not reader.fieldnames:
+                    raise ConfigError(f"No header row found in {csv_file}")
+
+                missing = required_columns - set(reader.fieldnames)
+                if missing:
+                    raise ConfigError(f"Missing required columns in {csv_file}: {', '.join(sorted(missing))}")
 
                 for row in reader:
                     # Validate required fields have values
                     for col in required_columns:
                         if not row.get(col, '').strip():
-                            console.print(f"[bold red]✗ ERROR:[/bold red] Empty value for required column '{col}' in row: {row}")
-                            sys.exit(1)
-                    switches.append(row)
-            console.print(f"[bold green]✓ INFO:[/bold green] Loaded {len(switches)} switches from {csv_file}")
+                            raise ConfigError(f"Empty value for required column '{col}' in row: {row}")
+                    switches.append(SwitchRecord.from_mapping(row))
+            thread_safe_print(f"INFO: Loaded {len(switches)} switches from {csv_file}")
             return switches
         except FileNotFoundError:
-            console.print(f"[bold red]✗ ERROR:[/bold red] File not found: {csv_file}")
-            sys.exit(1)
+            raise ConfigError(f"File not found: {csv_file}") from None
+        except ConfigError:
+            raise
         except Exception as e:
-            console.print(f"[bold red]✗ ERROR:[/bold red] Failed to load switches: {e}")
-            sys.exit(1)
+            raise ConfigError(f"Failed to load switches: {e}") from e
 
     def load_commands(self, commands_file: str) -> List[str]:
         """Load commands from text file"""
@@ -87,62 +298,71 @@ class SwitchConfigurator:
             # Directive keywords that should be preserved
             directives = ['#IF ', '#ELSE', '#ENDIF', '#FOR ', '#ENDFOR']
 
-            with self._commands_lock:
-                with open(commands_file, 'r', encoding='utf-8') as f:
-                    self.commands = []
-                    for line in f:
-                        stripped = line.strip()
-                        if not stripped:
-                            continue
-                        # Keep directives, skip regular comments
-                        if stripped.startswith('#'):
-                            if any(stripped.startswith(d) for d in directives):
-                                self.commands.append(stripped)
-                        else:
-                            self.commands.append(stripped)
+            commands: List[str] = []
+            with open(commands_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    # Keep directives, skip regular comments
+                    if stripped.startswith('#'):
+                        if any(stripped.startswith(d) for d in directives):
+                            commands.append(stripped)
+                    else:
+                        commands.append(stripped)
 
-                console.print(f"[bold green]✓ INFO:[/bold green] Loaded {len(self.commands)} commands from {commands_file}")
-                return self.commands.copy()
+            self.command_template = self.compile_command_template(commands)
+            self.commands = tuple(commands)
+
+            thread_safe_print(f"INFO: Loaded {len(self.commands)} commands from {commands_file}")
+            return list(self.commands)
         except FileNotFoundError:
-            console.print(f"[bold red]✗ ERROR:[/bold red] File not found: {commands_file}")
-            sys.exit(1)
+            raise ConfigError(f"File not found: {commands_file}") from None
+        except ConfigError:
+            raise
         except Exception as e:
-            console.print(f"[bold red]✗ ERROR:[/bold red] Failed to load commands: {e}")
-            sys.exit(1)
+            raise ConfigError(f"Failed to load commands: {e}") from e
 
     def load_prompt_handlers(self, prompt_file: str) -> Dict[str, str]:
         """Load prompt handling responses from file"""
         try:
-            with self._handlers_lock:
-                with open(prompt_file, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        if line.strip() and not line.startswith('#'):
-                            if '|' in line:
-                                prompt, response = line.strip().split('|', 1)
-                                response = response.strip()
-                                # Handle special keywords
-                                if response.upper() == 'RETURN' or response.upper() == 'ENTER':
-                                    response = '\n'
-                                elif response.upper() == 'YES':
-                                    response = 'yes\n'
-                                elif response.upper() == 'NO':
-                                    response = 'no\n'
-                                self.prompt_handlers[prompt.strip()] = response
-                console.print(f"[bold green]✓ INFO:[/bold green] Loaded {len(self.prompt_handlers)} prompt handlers from {prompt_file}")
-                return self.prompt_handlers.copy()
+            prompt_handlers: Dict[str, str] = {}
+            with open(prompt_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if line.strip() and not line.startswith('#'):
+                        if '|' in line:
+                            prompt, response = line.strip().split('|', 1)
+                            response = response.strip()
+                            # Handle special keywords
+                            if response.upper() == 'RETURN' or response.upper() == 'ENTER':
+                                response = '\n'
+                            elif response.upper() == 'YES':
+                                response = 'yes\n'
+                            elif response.upper() == 'NO':
+                                response = 'no\n'
+                            prompt_handlers[prompt.strip()] = response
+            self.prompt_handlers = MappingProxyType(prompt_handlers)
+            thread_safe_print(f"INFO: Loaded {len(self.prompt_handlers)} prompt handlers from {prompt_file}")
+            return dict(self.prompt_handlers)
         except FileNotFoundError:
-            console.print(f"[bold yellow]⚠ WARNING:[/bold yellow] Prompt handling file not found: {prompt_file}, continuing without prompt handlers")
+            thread_safe_print(f"WARNING: Prompt handling file not found: {prompt_file}; continuing without prompt handlers")
+            self.prompt_handlers = MappingProxyType({})
             return {}
         except Exception as e:
-            console.print(f"[bold yellow]⚠ WARNING:[/bold yellow] Failed to load prompt handlers: {e}, continuing without them")
+            thread_safe_print(f"WARNING: Failed to load prompt handlers: {e}; continuing without them")
+            self.prompt_handlers = MappingProxyType({})
             return {}
 
     def get_device_type(self, os_type: str) -> str:
         """Map OS type to netmiko device type"""
         os_mapping = {
-            'aruba_cx': 'aruba_osswitch',
-            'arubacx': 'aruba_osswitch',
-            'aruba': 'aruba_osswitch',
+            'aruba_cx': 'aruba_aoscx',
+            'arubacx': 'aruba_aoscx',
+            'aruba': 'aruba_aoscx',
+            'aruba_aoscx': 'aruba_aoscx',
+            'aruba_os': 'aruba_os',
+            'aruba_osswitch': 'aruba_osswitch',
+            'aruba_procurve': 'aruba_procurve',
             'cisco_ios_xe': 'cisco_ios',
             'cisco_xe': 'cisco_ios',
             'cisco': 'cisco_ios',
@@ -158,6 +378,7 @@ class SwitchConfigurator:
         """
         try:
             output: str = cast(str, connection.send_command('show archive', read_timeout=60))
+            log_device_output("Cisco archive check", output)
             # If archive is configured, output will show path
             if 'flash:' in output.lower() or 'bootflash:' in output.lower():
                 return True, ""
@@ -169,51 +390,59 @@ class SwitchConfigurator:
         """Configure archive on Cisco device if not already set up"""
         output: str = ""
         try:
-            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Configuring archive for rollback support...")
+            thread_safe_print("INFO: Configuring archive for rollback support...")
 
-            # Configure archive
+            # Configure archive in Netmiko config mode. Cisco treats the path value
+            # as a URL/prefix used by the archive subsystem.
             archive_commands = [
-                'configure terminal',
                 'archive',
                 'path flash:archive-config',
                 'maximum 10',
-                'end'
             ]
 
-            for cmd in archive_commands:
-                cmd_output: str = cast(str, connection.send_command(cmd, expect_string=r'#'))
-                output += cmd_output + "\n"
+            archive_output: str = cast(str, connection.send_config_set(
+                archive_commands,
+                enter_config_mode=True,
+                exit_config_mode=True,
+                cmd_verify=False,
+                read_timeout=240,
+            ))
+            output += archive_output + "\n"
+            log_device_output("Cisco archive setup", archive_output)
 
-                # Validate each command succeeded
-                if 'error' in cmd_output.lower() or 'invalid' in cmd_output.lower():
-                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Archive setup command failed: {cmd}")
-                    return False, output + f"\nERROR: Command '{cmd}' failed"
+            try:
+                validate_no_command_errors(archive_output, "Archive setup")
+            except DeviceExecutionError as e:
+                thread_safe_print("ERROR: Archive setup command failed")
+                return False, output + f"\nERROR: {str(e)}"
 
             # Save the archive configuration
             save_output: str = cast(str, connection.send_command('write memory', expect_string=r'#'))
             output += save_output + "\n"
+            log_device_output("Archive setup save", save_output)
 
-            if 'error' in save_output.lower() or not ('[OK]' in save_output or 'Building configuration' in save_output):
-                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to save archive configuration")
+            if find_error_line(save_output) or not output_indicates_save_success(save_output):
+                thread_safe_print(f"ERROR: Failed to save archive configuration")
                 return False, output + "\nERROR: Failed to save configuration"
 
             # Verify archive was actually configured
             verify_output: str = cast(str, connection.send_command('show archive'))
+            log_device_output("Archive setup verification", verify_output)
             if 'flash:' not in verify_output.lower() and 'bootflash:' not in verify_output.lower():
-                thread_safe_print("[bold red]✗ ERROR:[/bold red] Archive setup failed validation")
+                thread_safe_print("ERROR: Archive setup failed validation")
                 return False, output + "\nERROR: Archive not configured after setup"
 
-            thread_safe_print("[bold green]✓ SUCCESS:[/bold green] Archive configured successfully")
+            thread_safe_print("SUCCESS: Archive configured successfully")
             return True, output
         except Exception as e:
-            thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to configure archive: {escape(str(e))}")
+            thread_safe_print(f"ERROR: Failed to configure archive: {str(e)}")
             return False, output + f"\nERROR: {str(e)}"
 
     def configure_aruba_cx(self, connection: BaseConnection, commands: List[str]) -> Tuple[bool, str]:
         """Configure Aruba CX switch with checkpoint auto rollback protection"""
         output: str = ""
         try:
-            thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Starting auto checkpoint mode ({self.rollback_timer}-minute timer)...")
+            thread_safe_print(f"INFO: Starting auto checkpoint mode ({self.rollback_timer}-minute timer)...")
             # Start auto checkpoint mode with configurable timer
             # Creates checkpoint named AUTO<YYYYMMDDHHMMSS>
             try:
@@ -221,9 +450,9 @@ class SwitchConfigurator:
                                                            read_timeout=120,
                                                            expect_string=r'.*#'))
                 output += checkpoint_output + "\n"
-                thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] Checkpoint command output: {escape(checkpoint_output)}")
+                log_device_output("Aruba checkpoint auto", checkpoint_output)
             except Exception as e:
-                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to execute checkpoint auto command: {escape(str(e))}")
+                thread_safe_print(f"ERROR: Failed to execute checkpoint auto command: {str(e)}")
                 return False, output + f"\nERROR: {str(e)}"
 
             # Validate auto checkpoint started successfully
@@ -237,44 +466,38 @@ class SwitchConfigurator:
                 ('permission denied', 'Permission issue'),
             ]
 
-            checkpoint_lower = checkpoint_output.lower()
-
             # Check for actual errors (lines starting with error indicators)
             for line in checkpoint_output.split('\n'):
                 line_lower = line.strip().lower()
                 for pattern, description in error_patterns:
                     if line_lower.startswith(pattern) or (pattern in line_lower and ('error' in line_lower or '%' in line_lower)):
-                        thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to start auto checkpoint mode: {description}")
-                        thread_safe_print(f"[bold yellow]Output:[/bold yellow] {escape(checkpoint_output)}")
-                        thread_safe_print(f"[bold yellow]⚠ Hint:[/bold yellow] Check user permissions and Aruba CX OS version")
+                        thread_safe_print(f"ERROR: Failed to start auto checkpoint mode: {description}")
+                        thread_safe_print(f"OUTPUT: {str(checkpoint_output)}")
+                        thread_safe_print(f"HINT: Check user permissions and Aruba CX OS version")
                         return False, output
 
-            thread_safe_print("[bold green]✓ SUCCESS:[/bold green] Auto checkpoint validation passed")
-            thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Auto checkpoint active - config will auto-revert in {self.rollback_timer} minutes if not confirmed")
-            thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] About to execute {len(commands)} commands...")
-            thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] Command list: {commands[:3]}{'...' if len(commands) > 3 else ''}")
+            thread_safe_print("SUCCESS: Auto checkpoint validation passed")
+            thread_safe_print(f"INFO: Auto checkpoint active - config will auto-revert in {self.rollback_timer} minutes if not confirmed")
+            logger.debug("About to execute %s Aruba commands", len(commands))
+            logger.debug("Aruba command preview: %s", commands[:3])
 
             # Execute commands
-            thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Executing {len(commands)} commands...")
+            thread_safe_print(f"INFO: Executing {len(commands)} commands...")
             try:
                 cmd_output = self.execute_configuration_commands(connection, commands, already_in_config_mode=False)
                 output += cmd_output
-                thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] Command execution completed, output length: {len(cmd_output)} chars")
+                logger.debug("Aruba command execution completed, output length: %s chars", len(cmd_output))
             except Exception as e:
-                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Exception during command execution: {escape(str(e))}")
-                thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] Exception type: {type(e).__name__}")
+                thread_safe_print(f"ERROR: Exception during command execution: {str(e)}")
+                logger.debug("Exception type during Aruba command execution: %s", type(e).__name__)
                 raise
 
             # Exit config mode
             connection.exit_config_mode()
 
             # Confirm the auto checkpoint to save changes permanently
-            thread_safe_print()
-            thread_safe_print(Panel.fit(
-                "[bold green]CONFIGURATION APPLIED[/bold green]",
-                border_style="green"
-            ))
-            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Confirming auto checkpoint to save changes...")
+            thread_safe_print("SUCCESS: Configuration applied")
+            thread_safe_print("INFO: Confirming auto checkpoint to save changes...")
 
             # Use 'checkpoint auto confirm' to confirm the auto checkpoint
             try:
@@ -282,14 +505,14 @@ class SwitchConfigurator:
                                                          read_timeout=120,
                                                          expect_string=r'.*#'))
                 output += confirm_output + "\n"
+                log_device_output("Aruba checkpoint auto confirm", confirm_output)
             except Exception as e:
-                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to execute checkpoint auto confirm: {escape(str(e))}")
-                thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Configuration may auto-revert if timer expires")
+                thread_safe_print(f"ERROR: Failed to execute checkpoint auto confirm: {str(e)}")
+                thread_safe_print(f"WARNING: Configuration may auto-revert if timer expires")
                 return False, output + f"\nERROR: {str(e)}"
 
             # Validate confirmation succeeded
             # Be more specific about actual errors vs informational messages
-            confirm_lower = confirm_output.lower()
             has_error = False
             error_hint = "Configuration may auto-revert after timer expires"
 
@@ -314,17 +537,17 @@ class SwitchConfigurator:
                     break
 
             if has_error:
-                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to confirm auto checkpoint")
-                thread_safe_print(f"[bold yellow]Output:[/bold yellow] {escape(confirm_output)}")
-                thread_safe_print(f"[bold yellow]⚠ Hint:[/bold yellow] {error_hint}")
+                thread_safe_print(f"ERROR: Failed to confirm auto checkpoint")
+                thread_safe_print(f"OUTPUT: {str(confirm_output)}")
+                thread_safe_print(f"HINT: {error_hint}")
                 return False, output
 
-            thread_safe_print("[bold green]✓ SUCCESS:[/bold green] Auto checkpoint confirmed - configuration saved permanently!")
+            thread_safe_print("SUCCESS: Auto checkpoint confirmed - configuration saved permanently!")
             return True, output
 
         except Exception as e:
-            thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed during Aruba CX configuration: {escape(str(e))}")
-            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Checkpoint will auto-revert if active...")
+            thread_safe_print(f"ERROR: Failed during Aruba CX configuration: {str(e)}")
+            thread_safe_print("INFO: Checkpoint will auto-revert if active...")
             return False, output + f"\nERROR: {str(e)}"
 
     def configure_cisco_ios_xe(self, connection: BaseConnection, commands: List[str]) -> Tuple[bool, str]:
@@ -334,73 +557,199 @@ class SwitchConfigurator:
             # Check if archive is configured
             is_configured, error_msg = self.check_archive_configured(connection)
             if error_msg and "Failed to check" in error_msg:
-                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Cannot verify archive status: {escape(error_msg)}")
+                thread_safe_print(f"ERROR: Cannot verify archive status: {str(error_msg)}")
                 return False, output + f"\nERROR: {error_msg}"
             elif not is_configured:
-                thread_safe_print("[bold yellow]⚠ WARNING:[/bold yellow] Archive not configured, setting up now...")
+                thread_safe_print("WARNING: Archive not configured, setting up now...")
                 success, archive_output = self.setup_archive(connection)
                 output += archive_output + "\n"
                 if not success:
-                    thread_safe_print("[bold red]✗ ERROR:[/bold red] Cannot proceed without archive configuration")
+                    thread_safe_print("ERROR: Cannot proceed without archive configuration")
                     return False, output
             else:
-                thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Archive already configured")
+                thread_safe_print("INFO: Archive already configured")
 
-            thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Entering configuration mode with revert timer ({self.rollback_timer} minutes)...")
+            thread_safe_print(f"INFO: Entering configuration mode with revert timer ({self.rollback_timer} minutes)...")
             # Enter config mode with revert timer
             revert_output: str = cast(str, connection.send_command(f'configure terminal revert timer {self.rollback_timer}', expect_string=r'#'))
             output += revert_output + "\n"
+            log_device_output("Cisco configure terminal revert timer", revert_output)
 
             # Validate that revert timer was accepted
-            error_keywords = ['error', 'invalid', 'failed', 'not supported']
-            revert_lower = revert_output.lower()
-            for keyword in error_keywords:
-                if keyword in revert_lower:
-                    thread_safe_print("[bold red]✗ ERROR:[/bold red] Failed to enter revert mode - archive may not be properly configured")
-                    return False, output
+            revert_error = find_error_line(revert_output, (*ERROR_INDICATORS, 'failed', 'not supported'))
+            if revert_error:
+                thread_safe_print("ERROR: Failed to enter revert mode - archive may not be properly configured")
+                return False, output
 
-            thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Configuration mode entered - will auto-revert in {self.rollback_timer} minutes if not confirmed")
+            thread_safe_print(f"INFO: Configuration mode entered - will auto-revert in {self.rollback_timer} minutes if not confirmed")
 
             # Execute commands
-            thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Executing {len(commands)} commands...")
+            thread_safe_print(f"INFO: Executing {len(commands)} commands...")
             output += self.execute_configuration_commands(connection, commands, already_in_config_mode=True)
 
             # Exit config mode
             connection.exit_config_mode()
 
             # Automatically confirm changes
-            thread_safe_print()
-            thread_safe_print(Panel.fit(
-                "[bold green]CONFIGURATION APPLIED[/bold green]",
-                border_style="green"
-            ))
-            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Auto-confirming configuration changes...")
+            thread_safe_print("SUCCESS: Configuration applied")
+            thread_safe_print("INFO: Auto-confirming configuration changes...")
             confirm_output: str = cast(str, connection.send_command('configure confirm'))
             output += confirm_output + "\n"
+            log_device_output("Cisco configure confirm", confirm_output)
 
             # Validate confirmation succeeded
-            if 'error' in confirm_output.lower() or 'invalid' in confirm_output.lower():
-                thread_safe_print("[bold red]✗ ERROR:[/bold red] Failed to confirm configuration")
+            if find_error_line(confirm_output):
+                thread_safe_print("ERROR: Failed to confirm configuration")
                 return False, output
 
             # Save configuration
             save_output: str = cast(str, connection.send_command('write memory', expect_string=r'#'))
             output += save_output + "\n"
+            log_device_output("Cisco write memory", save_output)
 
             # Validate save succeeded
-            if 'error' in save_output.lower() or not ('[OK]' in save_output or 'Building configuration' in save_output):
-                thread_safe_print("[bold red]✗ ERROR:[/bold red] Failed to save configuration")
+            if find_error_line(save_output) or not output_indicates_save_success(save_output):
+                thread_safe_print("ERROR: Failed to save configuration")
                 return False, output
 
-            thread_safe_print("[bold green]✓ SUCCESS:[/bold green] Configuration confirmed and saved!")
+            thread_safe_print("SUCCESS: Configuration confirmed and saved!")
             return True, output
 
         except Exception as e:
-            thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed during Cisco IOS XE configuration: {escape(str(e))}")
-            thread_safe_print("[bold cyan]⚙ INFO:[/bold cyan] Configuration will auto-revert if active...")
+            thread_safe_print(f"ERROR: Failed during Cisco IOS XE configuration: {str(e)}")
+            thread_safe_print("INFO: Configuration will auto-revert if active...")
             return False, output + f"\nERROR: {str(e)}"
 
-    def substitute_variables(self, commands: List[str], switch: Dict) -> List[str]:
+    def compile_command_template(self, commands: Sequence[str]) -> Tuple[CommandNode, ...]:
+        """Validate and compile command directives once before any device connection."""
+        nodes, index, terminator = self._parse_command_block(commands, 0, ())
+        if terminator is not None:
+            raise CommandSyntaxError(f"Unexpected directive '{terminator}' at line {index + 1}")
+        if index != len(commands):
+            raise CommandSyntaxError(f"Unexpected parser stop at line {index + 1}")
+        return tuple(nodes)
+
+    def _parse_command_block(
+        self,
+        commands: Sequence[str],
+        start_index: int,
+        end_tokens: Tuple[str, ...],
+    ) -> Tuple[List[CommandNode], int, Optional[str]]:
+        """Parse commands until EOF or one of end_tokens is reached."""
+        nodes: List[CommandNode] = []
+        i = start_index
+
+        while i < len(commands):
+            line = commands[i].strip()
+
+            if any(line.startswith(token) for token in end_tokens):
+                return nodes, i, line
+
+            if line.startswith('#IF '):
+                condition = line[4:].strip()
+                if not condition:
+                    raise CommandSyntaxError(f"Empty #IF condition at line {i + 1}")
+
+                if_body, next_index, terminator = self._parse_command_block(
+                    commands,
+                    i + 1,
+                    ('#ELSE', '#ENDIF'),
+                )
+
+                else_body: List[CommandNode] = []
+                if terminator is None:
+                    raise CommandSyntaxError(f"Unmatched #IF starting at line {i + 1}")
+                if terminator.startswith('#ELSE'):
+                    else_body, next_index, terminator = self._parse_command_block(
+                        commands,
+                        next_index + 1,
+                        ('#ENDIF',),
+                    )
+                    if terminator is None:
+                        raise CommandSyntaxError(f"Unmatched #ELSE for #IF starting at line {i + 1}")
+                if not terminator.startswith('#ENDIF'):
+                    raise CommandSyntaxError(f"Unmatched #IF starting at line {i + 1}")
+
+                nodes.append(IfBlock(condition, tuple(if_body), tuple(else_body)))
+                i = next_index + 1
+                continue
+
+            if line.startswith('#FOR '):
+                for_parts = line[5:].strip().split(' IN ')
+                if len(for_parts) != 2:
+                    raise CommandSyntaxError(f"Invalid #FOR syntax at line {i + 1}: {line}")
+
+                var_name = for_parts[0].strip()
+                if not var_name.isidentifier():
+                    raise CommandSyntaxError(f"Invalid #FOR variable name at line {i + 1}: {var_name}")
+
+                count_expr = for_parts[1].strip()
+                if not count_expr:
+                    raise CommandSyntaxError(f"Missing #FOR loop count at line {i + 1}")
+
+                body, next_index, terminator = self._parse_command_block(
+                    commands,
+                    i + 1,
+                    ('#ENDFOR',),
+                )
+                if terminator is None:
+                    raise CommandSyntaxError(f"Unmatched #FOR starting at line {i + 1}")
+
+                nodes.append(ForBlock(var_name, count_expr, tuple(body)))
+                i = next_index + 1
+                continue
+
+            if line.startswith(('#ELSE', '#ENDIF', '#ENDFOR')):
+                raise CommandSyntaxError(f"Unexpected directive at line {i + 1}: {line}")
+
+            if line.startswith('#'):
+                i += 1
+                continue
+
+            if line:
+                nodes.append(TextCommand(line))
+
+            i += 1
+
+        return nodes, i, None
+
+    def render_command_template(self, switch: Mapping[str, Any]) -> List[str]:
+        """Render the precompiled command template for a switch row."""
+        if not self.command_template:
+            self.command_template = self.compile_command_template(self.commands)
+        return self._render_command_nodes(self.command_template, switch)
+
+    def _render_command_nodes(self, nodes: Sequence[CommandNode], switch: Mapping[str, Any]) -> List[str]:
+        """Evaluate command template nodes against a switch context."""
+        result: List[str] = []
+
+        for node in nodes:
+            if isinstance(node, TextCommand):
+                result.append(node.text)
+            elif isinstance(node, IfBlock):
+                branch = node.if_body if self._evaluate_condition(node.condition, switch) else node.else_body
+                result.extend(self._render_command_nodes(branch, switch))
+            elif isinstance(node, ForBlock):
+                if node.variable in switch:
+                    thread_safe_print(f"WARNING: FOR loop variable '{node.variable}' shadows existing CSV column")
+
+                count = self._get_loop_count(node.count_expr, switch)
+                logger.debug(
+                    "FOR loop will iterate %s times (variable: %s, expression: %s)",
+                    count,
+                    node.variable,
+                    node.count_expr,
+                )
+
+                for iteration in range(1, count + 1):
+                    temp_switch = dict(switch)
+                    temp_switch[node.variable] = str(iteration)
+                    expanded = self._render_command_nodes(node.body, temp_switch)
+                    result.extend(self.substitute_variables(expanded, temp_switch))
+
+        return result
+
+    def substitute_variables(self, commands: Sequence[str], switch: Mapping[str, Any]) -> List[str]:
         """Substitute variables in commands with values from switch CSV row"""
         substituted = []
         for cmd in commands:
@@ -411,11 +760,11 @@ class SwitchConfigurator:
                 substituted.append(substituted_cmd)
             except KeyError as e:
                 # If a variable is missing, keep the command as-is and warn
-                thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Variable {escape(str(e))} not found in CSV for command: {escape(cmd)}")
+                thread_safe_print(f"WARNING: Variable {str(e)} not found in CSV for command: {str(cmd)}")
                 substituted.append(cmd)
         return substituted
 
-    def parse_commands_with_conditionals(self, commands: List[str], switch: Dict) -> List[str]:
+    def parse_commands_with_conditionals(self, commands: Sequence[str], switch: Mapping[str, Any]) -> List[str]:
         """
         Parse commands and evaluate conditional directives.
         Returns flat list of commands to execute based on switch data.
@@ -425,97 +774,10 @@ class SwitchConfigurator:
         - #FOR/#ENDFOR loops
         - AND/OR logical operators
         """
-        result = []
-        i = 0
+        template = self.compile_command_template(commands)
+        return self._render_command_nodes(template, switch)
 
-        while i < len(commands):
-            line = commands[i].strip()
-
-            if line.startswith('#IF '):
-                # Parse IF block
-                condition = line[4:].strip()
-                condition_met = self._evaluate_condition(condition, switch)
-                block_end, else_index = self._find_block_end(commands, i, 'IF')
-
-                if condition_met:
-                    # Include IF block
-                    if_block = commands[i+1:else_index if else_index else block_end]
-                    result.extend(self.parse_commands_with_conditionals(if_block, switch))
-                elif else_index:
-                    # Include ELSE block
-                    else_block = commands[else_index+1:block_end]
-                    result.extend(self.parse_commands_with_conditionals(else_block, switch))
-
-                # Skip to line after block end (block_end points to #ENDIF)
-                i = block_end + 1
-                continue
-
-            elif line.startswith('#FOR '):
-                # Parse FOR loop: #FOR variable_name IN {count}
-                try:
-                    for_parts = line[5:].strip().split(' IN ')
-                    if len(for_parts) != 2:
-                        thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Invalid FOR syntax: {line}")
-                        i += 1
-                        continue
-
-                    var_name = for_parts[0].strip()
-
-                    # Validate variable name
-                    if not var_name.isidentifier():
-                        thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Invalid variable name '{var_name}' in FOR loop, skipping")
-                        i += 1
-                        continue
-
-                    # Warn if shadowing existing CSV column
-                    if var_name in switch:
-                        thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] FOR loop variable '{var_name}' shadows existing CSV column")
-
-                    count_expr = for_parts[1].strip()
-                    count = self._get_loop_count(count_expr, switch)
-                    thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] FOR loop will iterate {count} times (variable: {var_name}, expression: {count_expr})")
-
-                    block_end = self._find_block_end(commands, i, 'FOR')[0]
-                    loop_block = commands[i+1:block_end]
-
-                    # Expand block N times with variable substitution
-                    for iteration in range(1, count + 1):
-                        # Create temporary switch dict with loop variable
-                        temp_switch = switch.copy()
-                        temp_switch[var_name] = str(iteration)
-
-                        # Recursively parse the block with the loop variable
-                        expanded = self.parse_commands_with_conditionals(loop_block, temp_switch)
-                        # Substitute variables in the expanded commands with the loop variable
-                        substituted = self.substitute_variables(expanded, temp_switch)
-                        result.extend(substituted)
-
-                    # Skip to line after block end (block_end points to #ENDFOR)
-                    i = block_end + 1
-                    continue
-
-                except Exception as e:
-                    thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Error parsing FOR loop: {escape(str(e))}")
-                    i += 1
-                    continue
-
-            elif line.startswith('#ENDIF') or line.startswith('#ELSE') or line.startswith('#ENDFOR'):
-                # Skip directive markers (handled by block parsing)
-                pass
-
-            elif line.startswith('#'):
-                # Regular comment - skip
-                pass
-
-            elif line:
-                # Regular command - include it
-                result.append(line)
-
-            i += 1
-
-        return result
-
-    def _evaluate_condition(self, condition: str, switch: Dict) -> bool:
+    def _evaluate_condition(self, condition: str, switch: Mapping[str, Any]) -> bool:
         """
         Evaluate condition string against switch data with proper operator precedence.
         AND has higher precedence than OR.
@@ -530,10 +792,10 @@ class SwitchConfigurator:
             else:
                 return self._evaluate_and_condition(condition, switch)
         except Exception as e:
-            thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Error evaluating condition '{escape(condition)}': {escape(str(e))}")
+            thread_safe_print(f"WARNING: Error evaluating condition '{str(condition)}': {str(e)}")
             return False
 
-    def _evaluate_and_condition(self, condition: str, switch: Dict) -> bool:
+    def _evaluate_and_condition(self, condition: str, switch: Mapping[str, Any]) -> bool:
         """
         Evaluate AND conditions (higher precedence).
         Example: "{vendor} == cisco AND {stack} > 0"
@@ -544,7 +806,7 @@ class SwitchConfigurator:
         else:
             return self._evaluate_simple_condition(condition, switch)
 
-    def _evaluate_simple_condition(self, condition: str, switch: Dict) -> bool:
+    def _evaluate_simple_condition(self, condition: str, switch: Mapping[str, Any]) -> bool:
         """
         Evaluate simple condition: "{column} operator value"
         Supports: ==, !=, >, <, >=, <=
@@ -590,16 +852,16 @@ class SwitchConfigurator:
                     except (ValueError, TypeError):
                         # Numeric comparison failed - must be non-numeric values
                         # Don't fall back to string comparison for safety
-                        thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Cannot compare non-numeric values with {op}: '{left_val}' {op} '{right_val}'")
+                        thread_safe_print(f"WARNING: Cannot compare non-numeric values with {op}: '{left_val}' {op} '{right_val}'")
                         return False
 
         return False
 
-    def _get_loop_count(self, count_expr: str, switch: Dict) -> int:
+    def _get_loop_count(self, count_expr: str, switch: Mapping[str, Any]) -> int:
         """
         Get loop count from expression with maximum limit.
-        Examples: "#FOR i IN {stack}" → int(switch['stack'])
-                  "#FOR i IN 5" → 5
+        Examples: "#FOR i IN {stack}" -> int(switch['stack'])
+                  "#FOR i IN 5" -> 5
         Maximum iterations capped at MAX_LOOP_ITERATIONS to prevent memory exhaustion.
         """
         count_expr = count_expr.strip()
@@ -611,52 +873,23 @@ class SwitchConfigurator:
             try:
                 count = max(0, int(value))
                 if count > MAX_LOOP_ITERATIONS:
-                    thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Loop count {count} exceeds maximum {MAX_LOOP_ITERATIONS}, capping")
+                    thread_safe_print(f"WARNING: Loop count {count} exceeds maximum {MAX_LOOP_ITERATIONS}, capping")
                     return MAX_LOOP_ITERATIONS
                 return count
             except (ValueError, TypeError):
-                thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Invalid loop count '{value}' for {column}, using 0")
+                thread_safe_print(f"WARNING: Invalid loop count '{value}' for {column}, using 0")
                 return 0
 
         # Literal number
         try:
             count = max(0, int(count_expr))
             if count > MAX_LOOP_ITERATIONS:
-                thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Loop count {count} exceeds maximum {MAX_LOOP_ITERATIONS}, capping")
+                thread_safe_print(f"WARNING: Loop count {count} exceeds maximum {MAX_LOOP_ITERATIONS}, capping")
                 return MAX_LOOP_ITERATIONS
             return count
         except (ValueError, TypeError):
-            thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Invalid loop count '{count_expr}', using 0")
+            thread_safe_print(f"WARNING: Invalid loop count '{count_expr}', using 0")
             return 0
-
-    def _find_block_end(self, commands: List[str], start_index: int, block_type: str) -> Tuple[int, Optional[int]]:
-        """
-        Find the matching end directive for a block.
-        Returns: (end_index, else_index)
-        - end_index: index of #ENDIF or #ENDFOR
-        - else_index: index of #ELSE (only for IF blocks), or None
-
-        Handles nested blocks correctly.
-        """
-        end_directive = f'#END{block_type}'
-        else_directive = '#ELSE' if block_type == 'IF' else None
-
-        depth = 1
-        else_index = None
-
-        for i in range(start_index + 1, len(commands)):
-            line = commands[i].strip()
-
-            if line.startswith(f'#{block_type} '):
-                depth += 1
-            elif line.startswith(end_directive):
-                depth -= 1
-                if depth == 0:
-                    return (i, else_index)
-            elif line.startswith('#ELSE') and depth == 1 and else_directive:
-                else_index = i
-
-        raise ValueError(f"Unmatched {block_type} block starting at line {start_index + 1}")
 
     def _safe_disconnect(self, connection: Optional[BaseConnection], hostname: str) -> None:
         """Safely disconnect with proper error handling and resource cleanup"""
@@ -665,9 +898,9 @@ class SwitchConfigurator:
 
         try:
             connection.disconnect()
-            thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Disconnected from {hostname}")
+            thread_safe_print(f"INFO: Disconnected from {hostname}")
         except Exception as e:
-            thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Error disconnecting from {hostname}: {escape(str(e))}")
+            thread_safe_print(f"WARNING: Error disconnecting from {hostname}: {str(e)}")
             # Force close the socket if disconnect fails
             try:
                 if hasattr(connection, 'remote_conn') and connection.remote_conn:
@@ -678,10 +911,9 @@ class SwitchConfigurator:
 
     def get_prompt_response(self, command: str) -> Optional[str]:
         """Return the configured prompt response for a command, if one exists."""
-        with self._handlers_lock:
-            for prompt_match, response in self.prompt_handlers.items():
-                if prompt_match.lower() in command.lower():
-                    return response
+        for prompt_match, response in self.prompt_handlers.items():
+            if prompt_match.lower() in command.lower():
+                return response
         return None
 
     def execute_command_with_prompts(self, connection: BaseConnection, command: str, *, in_config_mode: bool = False) -> str:
@@ -692,24 +924,29 @@ class SwitchConfigurator:
                 output: str = cast(str, connection.send_command_timing(command))
                 if any(p in output.lower() for p in ['[y/n]', '(y/n)', 'confirm', '[yes/no]']):
                     output += cast(str, connection.send_command_timing(response))
+                log_device_output(f"Prompt-handled command '{command}'", output)
                 return output
 
             if in_config_mode:
-                return connection.send_config_set(
+                output = cast(str, connection.send_config_set(
                     [command],
                     enter_config_mode=False,
                     exit_config_mode=False,
                     cmd_verify=False,
-                )
+                ))
+                log_device_output(f"Config command '{command}'", output)
+                return output
 
-            return cast(str, connection.send_command(command, expect_string=r'#'))
+            output = cast(str, connection.send_command(command, expect_string=r'#'))
+            log_device_output(f"Command '{command}'", output)
+            return output
         except Exception as e:
             raise RuntimeError(f"ERROR executing '{command}': {str(e)}") from e
 
     def execute_configuration_batch(self, connection: BaseConnection, commands: List[str], *, enter_config_mode: bool) -> str:
         """Send a batch of non-interactive configuration commands through Netmiko config mode."""
         for cmd in commands:
-            thread_safe_print(f"  [dim cyan]→[/dim cyan] {cmd}")
+            thread_safe_print(f"COMMAND: {cmd}")
 
         output: str = cast(str, connection.send_config_set(
             commands,
@@ -718,17 +955,9 @@ class SwitchConfigurator:
             cmd_verify=False,  # Keep for performance, check output manually
             read_timeout=240,  # Extended timeout for TACACS+ authorization delays and slow devices
         ))
+        log_device_output("Configuration batch", output)
 
-        # Check output for common error indicators
-        error_indicators = ['% invalid', '% incomplete', '% error', 'command not found', 'syntax error', '% unknown command']
-        output_lower = output.lower()
-
-        for indicator in error_indicators:
-            if indicator in output_lower:
-                # Find the line with error
-                for line in output.split('\n'):
-                    if indicator in line.lower():
-                        raise RuntimeError(f"Command execution failed: {line.strip()}")
+        validate_no_command_errors(output, "Command execution")
 
         return output + "\n"
 
@@ -763,25 +992,21 @@ class SwitchConfigurator:
                 connection.config_mode()
                 in_config_mode = True
 
-            thread_safe_print(f"  [dim cyan]→[/dim cyan] {cmd}")
+            thread_safe_print(f"COMMAND: {cmd}")
             output += self.execute_command_with_prompts(connection, cmd, in_config_mode=True) + "\n"
 
         flush_pending_batch()
         return output
 
-    def configure_switch(self, switch: Dict) -> bool:
+    def configure_switch(self, switch: Union[SwitchRecord, Mapping[str, Any]]) -> bool:
         """Configure a single switch (thread-safe)"""
-        hostname = switch.get('switchname', 'unknown')
-        ip_address = switch.get('ip address', '')
-        os_type = switch.get('vendor', 'cisco').lower()
+        record = switch if isinstance(switch, SwitchRecord) else SwitchRecord.from_mapping(switch)
+        switch_context = record.to_context()
+        hostname = record.switchname
+        ip_address = record.ip_address
+        os_type = record.vendor.lower()
 
-        thread_safe_print()
-        thread_safe_print(Panel(
-            f"[bold white]Connecting to[/bold white] [cyan]{hostname}[/cyan] [dim]({ip_address})[/dim]\n"
-            f"[bold white]OS:[/bold white] [yellow]{os_type.upper()}[/yellow]",
-            border_style="cyan",
-            box=box.ROUNDED
-        ))
+        thread_safe_print(f"INFO: Connecting to {hostname} ({ip_address}) - OS: {os_type.upper()}")
 
         device_type = self.get_device_type(os_type)
 
@@ -791,10 +1016,14 @@ class SwitchConfigurator:
             'host': ip_address,
             'username': self.username,
             'password': self.password,
-            'timeout': 120,           # Increased timeout for slow devices
-            'session_timeout': 120,   # Command execution timeout
-            'global_delay_factor': 2, # Slow down for device compatibility
-            'fast_cli': False,        # Disable fast CLI to avoid prompt detection issues
+            'conn_timeout': 120,
+            'auth_timeout': 120,
+            'banner_timeout': 120,
+            'timeout': 120,
+            'session_timeout': 120,
+            'read_timeout_override': 240,
+            'global_delay_factor': 2,
+            'fast_cli': False,
         }
 
         # Aruba CX switches don't use 'enable' command - prevent netmiko from sending it
@@ -804,242 +1033,368 @@ class SwitchConfigurator:
         connection = None
         try:
             # Connect to device
-            thread_safe_print(f"[bold cyan]⚙ INFO:[/bold cyan] Establishing SSH connection...")
+            thread_safe_print(f"INFO: Establishing SSH connection...")
             connection = ConnectHandler(**device)
-            thread_safe_print(f"[bold green]✓ SUCCESS:[/bold green] Connected to {hostname}")
+            thread_safe_print(f"SUCCESS: Connected to {hostname}")
 
-            # Parse conditionals first, then substitute variables
-            # Make a copy to avoid race conditions with shared state
-            with self._commands_lock:
-                commands_copy = self.commands.copy()
+            parsed_commands = self.render_command_template(switch_context)
+            logger.debug(
+                "Parsed %s commands after conditional processing for %s",
+                len(parsed_commands),
+                hostname,
+            )
+            for idx, cmd in enumerate(parsed_commands, 1):
+                logger.debug("Parsed command for %s [%s]: %s", hostname, idx, cmd)
 
-            try:
-                parsed_commands = self.parse_commands_with_conditionals(commands_copy, switch)
-                thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan] Parsed {len(parsed_commands)} commands after conditional processing")
-                if len(parsed_commands) <= 10:
-                    for idx, cmd in enumerate(parsed_commands, 1):
-                        thread_safe_print(f"[bold cyan]⚙ DEBUG:[/bold cyan]   {idx}. {escape(cmd)}")
-            except ValueError as e:
-                thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Conditional parsing failed for {hostname}: {escape(str(e))}")
-                thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] Falling back to commands without conditionals")
-                # Fallback: use original commands without conditional parsing (filter out directives)
-                parsed_commands = [cmd for cmd in commands_copy if not cmd.startswith('#')]
-
-            switch_commands = self.substitute_variables(parsed_commands, switch)
+            switch_commands = self.substitute_variables(parsed_commands, switch_context)
 
             # Check for empty command list
             if not switch_commands:
-                thread_safe_print(f"[bold yellow]⚠ WARNING:[/bold yellow] No commands to execute after conditional parsing for {hostname}")
+                thread_safe_print(f"WARNING: No commands to execute after conditional parsing for {hostname}")
                 self._safe_disconnect(connection, hostname)
                 return True  # Not an error, just no work to do
 
             # Determine OS and configure accordingly
-            success = False
             if 'aruba' in os_type:
-                success, output = self.configure_aruba_cx(connection, switch_commands)
+                success, _output = self.configure_aruba_cx(connection, switch_commands)
             else:
-                success, output = self.configure_cisco_ios_xe(connection, switch_commands)
+                success, _output = self.configure_cisco_ios_xe(connection, switch_commands)
 
             # Disconnect
             self._safe_disconnect(connection, hostname)
             return success
 
         except NetmikoTimeoutException:
-            thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Connection timeout to {hostname} ({ip_address})")
+            thread_safe_print(f"ERROR: Connection timeout to {hostname} ({ip_address})")
             self._safe_disconnect(connection, hostname)
             return False
         except NetmikoAuthenticationException:
-            thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Authentication failed to {hostname} ({ip_address})")
+            thread_safe_print(f"ERROR: Authentication failed to {hostname} ({ip_address})")
             self._safe_disconnect(connection, hostname)
             return False
         except Exception as e:
-            thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Failed to configure {hostname}: {escape(str(e))}")
+            thread_safe_print(f"ERROR: Failed to configure {hostname}: {str(e)}")
             self._safe_disconnect(connection, hostname)
             return False
 
+    def run_switches(
+        self,
+        switches: Sequence[Union[SwitchRecord, Mapping[str, Any]]],
+        *,
+        max_workers: int = 10,
+        progress_callback: Optional[Callable[[], None]] = None,
+    ) -> List[SwitchResult]:
+        """Configure switches concurrently and always return one result per switch."""
+        if not switches:
+            return []
 
-def main():
-    """Main execution function"""
-    console.print()
-    console.print(Panel.fit(
-        "[bold cyan]Network Switch Configurator[/bold cyan]\n"
-        "[dim]Automated SSH Configuration with Rollback Support[/dim]",
-        border_style="cyan",
-        box=box.DOUBLE
-    ))
+        results: List[SwitchResult] = []
+        completed_futures = set()
+        worker_count = min(max_workers, len(switches))
 
-    # Get credentials
-    console.print("\n[bold]Please enter SSH credentials:[/bold]")
-    username = Prompt.ask("[cyan]Username[/cyan]").strip()
-    if not username:
-        console.print("[bold red]✗ ERROR:[/bold red] Username cannot be empty")
-        sys.exit(1)
-
-    password = getpass.getpass("Password: ")
-    if not password:
-        console.print("[bold red]✗ ERROR:[/bold red] Password cannot be empty")
-        sys.exit(1)
-
-    # Get rollback timer
-    console.print()
-    rollback_timer_str = Prompt.ask(
-        "[cyan]Rollback timer in minutes[/cyan] [dim](time before auto-revert)[/dim]",
-        default="2"
-    ).strip()
-
-    try:
-        rollback_timer = int(rollback_timer_str)
-        if rollback_timer < 1 or rollback_timer > 60:
-            console.print("[bold red]✗ ERROR:[/bold red] Rollback timer must be between 1 and 60 minutes")
-            sys.exit(1)
-    except ValueError:
-        console.print("[bold red]✗ ERROR:[/bold red] Rollback timer must be a valid number")
-        sys.exit(1)
-
-    # Initialize configurator
-    configurator = SwitchConfigurator(username, password, rollback_timer)
-
-    # Load files
-    console.print("\n[bold]Loading configuration files...[/bold]")
-    switches = configurator.load_switches('switches.csv')
-    commands = configurator.load_commands('commands.txt')
-    configurator.load_prompt_handlers('prompthandling.txt')
-
-    if not switches:
-        console.print("[bold red]✗ ERROR:[/bold red] No switches to configure")
-        sys.exit(1)
-
-    if not commands:
-        console.print("[bold red]✗ ERROR:[/bold red] No commands to execute")
-        sys.exit(1)
-
-    # Display summary
-    console.print()
-    summary_table = Table(title="Configuration Summary", box=box.ROUNDED, border_style="cyan")
-    summary_table.add_column("Parameter", style="cyan", justify="left")
-    summary_table.add_column("Value", style="green", justify="right")
-    summary_table.add_row("Switches to configure", str(len(switches)))
-    summary_table.add_row("Commands to execute", str(len(commands)))
-    summary_table.add_row("Prompt handlers", str(len(configurator.prompt_handlers)))
-    summary_table.add_row("Rollback timer", f"{rollback_timer} minutes")
-    console.print(summary_table)
-
-    # Confirm before proceeding
-    console.print()
-    if not Confirm.ask("[bold yellow]Proceed with configuration?[/bold yellow]", default=False):
-        console.print("[bold cyan]⚙ INFO:[/bold cyan] Configuration cancelled by user")
-        sys.exit(0)
-
-    # Configure switches concurrently (max 10 at a time)
-    console.print()
-    console.print(f"[bold cyan]⚙ INFO:[/bold cyan] Configuring switches with up to 10 concurrent threads...")
-    console.print()
-
-    results = []
-    max_workers = min(10, len(switches))  # Up to 10 concurrent threads
-
-    # Use ThreadPoolExecutor for concurrent execution
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        console=console
-    ) as progress:
-        task = progress.add_task(
-            f"[cyan]Configuring {len(switches)} switches...",
-            total=len(switches)
-        )
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all switch configuration tasks
+        executor = ThreadPoolExecutor(max_workers=worker_count)
+        shutdown_wait = True
+        try:
             future_to_switch = {
-                executor.submit(configurator.configure_switch, switch): switch
+                executor.submit(self.configure_switch, switch): switch
                 for switch in switches
             }
 
-            # Process completed tasks as they finish
-            for future in as_completed(future_to_switch, timeout=THREAD_TIMEOUT * len(switches)):
-                switch = future_to_switch[future]
-                try:
-                    success = future.result(timeout=THREAD_TIMEOUT)  # Per-thread timeout
-                    results.append({
-                        'hostname': switch.get('switchname', 'unknown'),
-                        'ip': switch.get('ip address', 'unknown'),
-                        'vendor': switch.get('vendor', 'unknown'),
-                        'success': success
-                    })
-                except FuturesTimeoutError:
-                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Configuration timeout for {switch.get('switchname', 'unknown')} (>{THREAD_TIMEOUT}s)")
-                    results.append({
-                        'hostname': switch.get('switchname', 'unknown'),
-                        'ip': switch.get('ip address', 'unknown'),
-                        'vendor': switch.get('vendor', 'unknown'),
-                        'success': False
-                    })
-                except Exception as e:
-                    thread_safe_print(f"[bold red]✗ ERROR:[/bold red] Unexpected error for {switch.get('switchname', 'unknown')}: {escape(str(e))}")
-                    results.append({
-                        'hostname': switch.get('switchname', 'unknown'),
-                        'ip': switch.get('ip address', 'unknown'),
-                        'vendor': switch.get('vendor', 'unknown'),
-                        'success': False
-                    })
-                finally:
-                    with console_lock:
-                        progress.update(task, advance=1)
+            try:
+                for future in as_completed(future_to_switch, timeout=THREAD_TIMEOUT * len(future_to_switch)):
+                    completed_futures.add(future)
+                    switch = future_to_switch[future]
+                    try:
+                        success = future.result()
+                        results.append(switch_result_from_record(switch, success))
+                    except Exception as e:
+                        record = switch if isinstance(switch, SwitchRecord) else SwitchRecord.from_mapping(switch)
+                        thread_safe_print(f"ERROR: Unexpected error for {record.switchname}: {str(e)}")
+                        results.append(switch_result_from_record(switch, False, str(e)))
+                    finally:
+                        if progress_callback:
+                            progress_callback()
+            except FuturesTimeoutError:
+                timed_out = [
+                    (future, switch)
+                    for future, switch in future_to_switch.items()
+                    if future not in completed_futures
+                ]
+                for future, switch in timed_out:
+                    future.cancel()
+                    record = switch if isinstance(switch, SwitchRecord) else SwitchRecord.from_mapping(switch)
+                    error = "Configuration timeout before completion"
+                    thread_safe_print(f"ERROR: {error} for {record.switchname}")
+                    results.append(switch_result_from_record(switch, False, error))
+                    if progress_callback:
+                        progress_callback()
+                shutdown_wait = False
+        finally:
+            executor.shutdown(wait=shutdown_wait, cancel_futures=True)
 
-    # Display final results
-    console.print()
-    results_table = Table(
-        title="[bold]Final Results[/bold]",
-        box=box.DOUBLE,
-        border_style="cyan",
-        show_header=True,
-        header_style="bold cyan"
-    )
-    results_table.add_column("Status", justify="center", width=10)
-    results_table.add_column("Hostname", style="white", justify="left")
-    results_table.add_column("IP Address", style="dim", justify="left")
-    results_table.add_column("Vendor", style="yellow", justify="left")
+        return results
 
-    for result in results:
-        status_icon = "[bold green]✓ OK[/bold green]" if result['success'] else "[bold red]✗ FAIL[/bold red]"
-        results_table.add_row(
-            status_icon,
-            result['hostname'],
-            result['ip'],
-            result['vendor']
+
+class SwitchConfiguratorApp(App[None]):
+    """Textual interface for safe multi-switch configuration."""
+
+    TITLE = "Network Switch Configurator"
+    SUB_TITLE = "SSH configuration with rollback protection"
+    CSS = """
+    Screen {
+        background: #101418;
+        color: #e9eef2;
+    }
+
+    #app-frame {
+        padding: 1 2;
+        layout: vertical;
+        height: 100%;
+    }
+
+    #title {
+        text-style: bold;
+        color: #ffffff;
+        padding: 0 0 1 0;
+    }
+
+    #subtitle {
+        color: #a7b3bd;
+        padding: 0 0 1 0;
+    }
+
+    #form {
+        height: auto;
+        border: solid #2b3a42;
+        padding: 1;
+        margin-bottom: 1;
+    }
+
+    .field {
+        width: 1fr;
+        margin-right: 1;
+    }
+
+    #run {
+        width: 16;
+        margin-top: 1;
+    }
+
+    #summary {
+        height: 3;
+        color: #cdd6dd;
+        padding: 0 1;
+        border: solid #2b3a42;
+        margin-bottom: 1;
+    }
+
+    #progress {
+        height: 3;
+        margin-bottom: 1;
+    }
+
+    #results {
+        height: 12;
+        border: solid #2b3a42;
+        margin-bottom: 1;
+    }
+
+    #events {
+        height: 1fr;
+        border: solid #2b3a42;
+        padding: 0 1;
+    }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.worker_thread: Optional[threading.Thread] = None
+        self.run_in_progress = False
+
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        with Container(id="app-frame"):
+            yield Static("Network Switch Configurator", id="title")
+            yield Static("Bulk SSH configuration for Aruba CX and Cisco IOS XE with timed rollback protection.", id="subtitle")
+            with Vertical(id="form"):
+                with Horizontal():
+                    yield Input(placeholder="SSH username", id="username", classes="field")
+                    yield Input(placeholder="SSH password", password=True, id="password", classes="field")
+                    yield Input(value="2", placeholder="Rollback minutes (1-60)", id="rollback", classes="field")
+                yield Button("Run configuration", id="run", variant="primary")
+            yield Static("Ready. Review switches.csv and commands.txt before running.", id="summary")
+            yield ProgressBar(total=1, show_eta=False, id="progress")
+            yield DataTable(id="results")
+            yield Log(id="events", highlight=False)
+        yield Footer()
+
+    def on_mount(self) -> None:
+        table = self.query_one("#results", DataTable)
+        table.add_columns("Status", "Hostname", "IP Address", "Vendor", "Detail")
+        self.query_one("#progress", ProgressBar).update(total=1, progress=0)
+        set_status_callback(self.post_status_from_worker)
+
+    def on_unmount(self) -> None:
+        set_status_callback(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "run":
+            self.start_run()
+
+    def start_run(self) -> None:
+        if self.run_in_progress:
+            return
+
+        username = self.query_one("#username", Input).value.strip()
+        password = self.query_one("#password", Input).value
+        rollback_value = self.query_one("#rollback", Input).value.strip()
+
+        if not username:
+            self.add_status(StatusEvent("Username is required.", "error"))
+            return
+        if not password:
+            self.add_status(StatusEvent("Password is required.", "error"))
+            return
+
+        try:
+            rollback_timer = int(rollback_value)
+        except ValueError:
+            self.add_status(StatusEvent("Rollback timer must be a whole number.", "error"))
+            return
+
+        if rollback_timer < ROLLBACK_TIMER_MIN or rollback_timer > ROLLBACK_TIMER_MAX:
+            self.add_status(StatusEvent(f"Rollback timer must be between {ROLLBACK_TIMER_MIN} and {ROLLBACK_TIMER_MAX} minutes.", "error"))
+            return
+
+        run_config = RunConfig(username=username, password=password, rollback_timer=rollback_timer)
+        self.run_in_progress = True
+        self.query_one("#run", Button).disabled = True
+        self.query_one("#summary", Static).update("Loading configuration files...")
+        self.query_one("#results", DataTable).clear()
+        self.query_one("#progress", ProgressBar).update(total=1, progress=0)
+        self.query_one("#events", Log).clear()
+        self.add_status(StatusEvent("Run started.", "info"))
+
+        self.worker_thread = threading.Thread(
+            target=self.run_configuration,
+            args=(run_config,),
+            name="config-runner",
+            daemon=True,
         )
+        self.worker_thread.start()
 
-    console.print(results_table)
+    def post_status_from_worker(self, event: StatusEvent) -> None:
+        try:
+            self.call_from_thread(self.add_status, event)
+        except RuntimeError:
+            self.add_status(event)
 
-    success_count = sum(1 for r in results if r['success'])
-    total_count = len(results)
+    def add_status(self, event: StatusEvent) -> None:
+        prefix = {
+            "success": "OK",
+            "warning": "WARN",
+            "error": "FAIL",
+            "info": "INFO",
+        }.get(event.level, "INFO")
+        message = f"{prefix}: {event.message}"
+        self.query_one("#events", Log).write_line(message)
 
-    if success_count == total_count:
-        status_style = "bold green"
-        status_msg = "All switches configured successfully!"
-    elif success_count > 0:
-        status_style = "bold yellow"
-        status_msg = f"Partial success: {success_count}/{total_count} switches configured"
-    else:
-        status_style = "bold red"
-        status_msg = "All configurations failed"
+    def run_configuration(self, run_config: RunConfig) -> None:
+        setup_logging()
+        configurator = SwitchConfigurator(run_config.username, run_config.password, run_config.rollback_timer)
 
-    console.print()
-    console.print(Panel.fit(
-        f"[{status_style}]{status_msg}[/{status_style}]",
-        border_style=status_style.split()[1] if status_style else "white"
-    ))
+        try:
+            switches = configurator.load_switches(run_config.switches_file)
+            commands = configurator.load_commands(run_config.commands_file)
+            configurator.load_prompt_handlers(run_config.prompt_file)
+
+            if not switches:
+                raise ConfigError("No switches to configure")
+            if not commands:
+                raise ConfigError("No commands to execute")
+
+            max_workers = min(run_config.max_workers, len(switches))
+            self.call_from_thread(
+                self.prepare_execution,
+                len(switches),
+                len(commands),
+                len(configurator.prompt_handlers),
+                run_config.rollback_timer,
+                max_workers,
+            )
+
+            results = configurator.run_switches(
+                switches,
+                max_workers=max_workers,
+                progress_callback=lambda: self.call_from_thread(self.advance_progress),
+            )
+            self.call_from_thread(self.finish_run, results)
+        except Exception as e:
+            logger.exception("Run failed")
+            self.call_from_thread(self.fail_run, str(e))
+
+    def prepare_execution(self, switch_count: int, command_count: int, handler_count: int, rollback_timer: int, max_workers: int) -> None:
+        summary = (
+            f"{switch_count} switches | {command_count} commands | "
+            f"{handler_count} prompt handlers | rollback {rollback_timer} min | {max_workers} workers"
+        )
+        self.query_one("#summary", Static).update(summary)
+        self.query_one("#progress", ProgressBar).update(total=switch_count, progress=0)
+        self.add_status(StatusEvent("Configuration files validated. Starting SSH sessions.", "success"))
+
+    def advance_progress(self) -> None:
+        self.query_one("#progress", ProgressBar).advance(1)
+
+    def finish_run(self, results: Sequence[SwitchResult]) -> None:
+        table = self.query_one("#results", DataTable)
+        table.clear()
+        for result in results:
+            table.add_row(
+                "OK" if result.success else "FAIL",
+                result.hostname,
+                result.ip,
+                result.vendor,
+                result.error,
+            )
+
+        success_count = sum(1 for result in results if result.success)
+        total = len(results)
+        if success_count == total:
+            summary = f"Complete: all {total} switches configured successfully."
+            level = "success"
+        elif success_count:
+            summary = f"Complete: {success_count}/{total} switches configured successfully."
+            level = "warning"
+        else:
+            summary = "Complete: all switch configurations failed."
+            level = "error"
+
+        self.query_one("#summary", Static).update(summary)
+        self.add_status(StatusEvent(summary, level))
+        self.run_in_progress = False
+        self.query_one("#run", Button).disabled = False
+
+    def fail_run(self, error: str) -> None:
+        self.query_one("#summary", Static).update(f"Run failed: {error}")
+        self.add_status(StatusEvent(error, "error"))
+        self.run_in_progress = False
+        self.query_one("#run", Button).disabled = False
+
+
+def main() -> None:
+    """Run the Textual TUI."""
+    SwitchConfiguratorApp().run()
 
 
 if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
-        console.print("\n[bold cyan]⚙ INFO:[/bold cyan] Configuration cancelled by user (Ctrl+C)")
+        sys.stderr.write("Configuration cancelled by user.\n")
         sys.exit(0)
+    except ConfigError as e:
+        sys.stderr.write(f"ERROR: {str(e)}\n")
+        sys.exit(1)
     except Exception as e:
-        console.print(f"\n[bold red]✗ ERROR:[/bold red] Unexpected error: {escape(str(e))}")
+        sys.stderr.write(f"Unexpected error: {str(e)}\n")
         sys.exit(1)

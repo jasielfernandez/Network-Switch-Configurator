@@ -37,6 +37,9 @@ Thumbs.db
 # Sensitive data - switch inventory should not be committed
 switches.csv
 
+# Runtime logs
+logs/
+
 # Uncomment to exclude configuration files if they contain sensitive data
 # commands.txt
 # prompthandling.txt
