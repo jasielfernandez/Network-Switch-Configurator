@@ -1,5 +1,4 @@
 import unittest
-import asyncio
 import logging
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from pathlib import Path
@@ -11,8 +10,9 @@ from switch_configurator import (
     ConfigError,
     DeviceExecutionError,
     SwitchConfigurator,
-    SwitchConfiguratorApp,
     SwitchRecord,
+    SwitchResult,
+    build_results_table,
     logger,
 )
 
@@ -782,17 +782,15 @@ class LoggingTests(unittest.TestCase):
         self.assertFalse(any(isinstance(handler, logging.FileHandler) for handler in logger.handlers))
 
 
-class TextualAppTests(unittest.TestCase):
-    def test_app_mounts_core_widgets_headlessly(self):
-        async def run_app() -> None:
-            app = SwitchConfiguratorApp()
-            async with app.run_test() as pilot:
-                await pilot.pause()
-                self.assertIsNotNone(app.query_one("#username"))
-                self.assertIsNotNone(app.query_one("#results"))
-                self.assertIsNotNone(app.query_one("#events"))
+class RichRenderingTests(unittest.TestCase):
+    def test_results_table_renders_success_and_failure_rows(self):
+        table = build_results_table([
+            SwitchResult("sw1", "10.0.0.1", "cisco", True),
+            SwitchResult("sw2", "10.0.0.2", "aruba", False, "failed"),
+        ])
 
-        asyncio.run(run_app())
+        self.assertEqual(table.title, "Final Results")
+        self.assertEqual(len(table.rows), 2)
 
 
 class GitIgnoreTests(unittest.TestCase):

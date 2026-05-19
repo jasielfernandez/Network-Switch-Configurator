@@ -17,14 +17,19 @@ from types import MappingProxyType
 from typing import Any, Callable, List, Dict, Mapping, Sequence, Tuple, Optional, Union, cast
 from netmiko import ConnectHandler, NetmikoTimeoutException, NetmikoAuthenticationException
 from netmiko.base_connection import BaseConnection
-from textual.app import App, ComposeResult
-from textual.containers import Container, Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, DataTable, Footer, Header, Input, Log, ProgressBar, Static
+from rich import box
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+from rich.prompt import Confirm, Prompt
+from rich.table import Table
 
 status_lock = threading.Lock()
 _status_callback: Optional[Callable[["StatusEvent"], None]] = None
+console = Console()
+console_lock = threading.Lock()
 
-# File-only logging. Operator-facing status stays in the Textual UI; diagnostics
+# File-only logging. Operator-facing status stays in the Rich UI; diagnostics
 # and raw device output go to this single log file.
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 LOG_FILE = LOG_DIR / "switch_configurator.log"
@@ -195,7 +200,7 @@ def infer_status_level(message: str) -> str:
 
 
 def thread_safe_print(*args, **kwargs):
-    """Compatibility status emitter used by worker code; does not print."""
+    """Compatibility status emitter used by worker code."""
     message = " ".join(strip_markup(arg) for arg in args if str(arg).strip())
     if not message:
         return
@@ -1135,255 +1140,170 @@ class SwitchConfigurator:
         return results
 
 
-class SwitchConfiguratorApp(App[None]):
-    """Textual interface for safe multi-switch configuration."""
+def status_style(level: str) -> str:
+    """Map status levels to Rich styles."""
+    return {
+        "success": "green",
+        "warning": "yellow",
+        "error": "red",
+        "info": "cyan",
+    }.get(level, "white")
 
-    TITLE = "Network Switch Configurator"
-    SUB_TITLE = "SSH configuration with rollback protection"
-    CSS = """
-    Screen {
-        background: #101418;
-        color: #e9eef2;
-    }
 
-    #app-frame {
-        padding: 1 2;
-        layout: vertical;
-        height: 100%;
-    }
+def print_status(event: StatusEvent) -> None:
+    """Render a concise worker status event."""
+    with console_lock:
+        console.print(event.message, style=status_style(event.level), markup=False)
 
-    #title {
-        text-style: bold;
-        color: #ffffff;
-        padding: 0 0 1 0;
-    }
 
-    #subtitle {
-        color: #a7b3bd;
-        padding: 0 0 1 0;
-    }
+def prompt_run_config() -> RunConfig:
+    """Collect operator input for a run."""
+    console.print(Panel.fit(
+        "[bold cyan]Network Switch Configurator[/bold cyan]\n"
+        "[dim]SSH configuration with timed rollback protection[/dim]",
+        border_style="cyan",
+        box=box.ROUNDED,
+    ))
 
-    #form {
-        height: auto;
-        border: solid #2b3a42;
-        padding: 1;
-        margin-bottom: 1;
-    }
+    username = Prompt.ask("SSH username").strip()
+    if not username:
+        raise ConfigError("Username cannot be empty")
 
-    .field {
-        width: 1fr;
-        margin-right: 1;
-    }
+    password = Prompt.ask("SSH password", password=True)
+    if not password:
+        raise ConfigError("Password cannot be empty")
 
-    #run {
-        width: 16;
-        margin-top: 1;
-    }
+    rollback_value = Prompt.ask(
+        f"Rollback timer in minutes ({ROLLBACK_TIMER_MIN}-{ROLLBACK_TIMER_MAX})",
+        default="2",
+    ).strip()
 
-    #summary {
-        height: 3;
-        color: #cdd6dd;
-        padding: 0 1;
-        border: solid #2b3a42;
-        margin-bottom: 1;
-    }
+    try:
+        rollback_timer = int(rollback_value)
+    except ValueError:
+        raise ConfigError("Rollback timer must be a whole number") from None
 
-    #progress {
-        height: 3;
-        margin-bottom: 1;
-    }
+    if rollback_timer < ROLLBACK_TIMER_MIN or rollback_timer > ROLLBACK_TIMER_MAX:
+        raise ConfigError(f"Rollback timer must be between {ROLLBACK_TIMER_MIN} and {ROLLBACK_TIMER_MAX} minutes")
 
-    #results {
-        height: 12;
-        border: solid #2b3a42;
-        margin-bottom: 1;
-    }
+    return RunConfig(username=username, password=password, rollback_timer=rollback_timer)
 
-    #events {
-        height: 1fr;
-        border: solid #2b3a42;
-        padding: 0 1;
-    }
-    """
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.worker_thread: Optional[threading.Thread] = None
-        self.run_in_progress = False
+def build_summary_table(
+    switch_count: int,
+    command_count: int,
+    handler_count: int,
+    rollback_timer: int,
+    max_workers: int,
+) -> Table:
+    """Build the pre-run summary table."""
+    table = Table(title="Run Summary", box=box.SIMPLE_HEAVY, border_style="cyan")
+    table.add_column("Item", style="cyan", no_wrap=True)
+    table.add_column("Value", style="white")
+    table.add_row("Switches", str(switch_count))
+    table.add_row("Commands", str(command_count))
+    table.add_row("Prompt handlers", str(handler_count))
+    table.add_row("Rollback timer", f"{rollback_timer} minutes")
+    table.add_row("Concurrency", f"{max_workers} workers")
+    table.add_row("Log file", str(LOG_FILE.relative_to(Path(__file__).resolve().parent)))
+    return table
 
-    def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
-        with Container(id="app-frame"):
-            yield Static("Network Switch Configurator", id="title")
-            yield Static("Bulk SSH configuration for Aruba CX and Cisco IOS XE with timed rollback protection.", id="subtitle")
-            with Vertical(id="form"):
-                with Horizontal():
-                    yield Input(placeholder="SSH username", id="username", classes="field")
-                    yield Input(placeholder="SSH password", password=True, id="password", classes="field")
-                    yield Input(value="2", placeholder="Rollback minutes (1-60)", id="rollback", classes="field")
-                yield Button("Run configuration", id="run", variant="primary")
-            yield Static("Ready. Review switches.csv and commands.txt before running.", id="summary")
-            yield ProgressBar(total=1, show_eta=False, id="progress")
-            yield DataTable(id="results")
-            yield Log(id="events", highlight=False)
-        yield Footer()
 
-    def on_mount(self) -> None:
-        table = self.query_one("#results", DataTable)
-        table.add_columns("Status", "Hostname", "IP Address", "Vendor", "Detail")
-        self.query_one("#progress", ProgressBar).update(total=1, progress=0)
-        set_status_callback(self.post_status_from_worker)
+def build_results_table(results: Sequence[SwitchResult]) -> Table:
+    """Build the final results table."""
+    table = Table(title="Final Results", box=box.SIMPLE_HEAVY, border_style="cyan")
+    table.add_column("Status", justify="center", no_wrap=True)
+    table.add_column("Hostname", style="white")
+    table.add_column("IP Address", style="dim")
+    table.add_column("Vendor", style="yellow")
+    table.add_column("Detail", style="dim")
 
-    def on_unmount(self) -> None:
-        set_status_callback(None)
+    for result in results:
+        status = "[green]OK[/green]" if result.success else "[red]FAIL[/red]"
+        table.add_row(status, result.hostname, result.ip, result.vendor, result.error)
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "run":
-            self.start_run()
+    return table
 
-    def start_run(self) -> None:
-        if self.run_in_progress:
-            return
 
-        username = self.query_one("#username", Input).value.strip()
-        password = self.query_one("#password", Input).value
-        rollback_value = self.query_one("#rollback", Input).value.strip()
+def print_final_summary(results: Sequence[SwitchResult]) -> None:
+    """Render the final completion summary."""
+    success_count = sum(1 for result in results if result.success)
+    total = len(results)
+    if success_count == total:
+        style = "green"
+        message = f"Complete: all {total} switches configured successfully."
+    elif success_count:
+        style = "yellow"
+        message = f"Complete: {success_count}/{total} switches configured successfully."
+    else:
+        style = "red"
+        message = "Complete: all switch configurations failed."
 
-        if not username:
-            self.add_status(StatusEvent("Username is required.", "error"))
-            return
-        if not password:
-            self.add_status(StatusEvent("Password is required.", "error"))
-            return
+    console.print(Panel.fit(f"[bold {style}]{message}[/bold {style}]", border_style=style, box=box.ROUNDED))
 
-        try:
-            rollback_timer = int(rollback_value)
-        except ValueError:
-            self.add_status(StatusEvent("Rollback timer must be a whole number.", "error"))
-            return
 
-        if rollback_timer < ROLLBACK_TIMER_MIN or rollback_timer > ROLLBACK_TIMER_MAX:
-            self.add_status(StatusEvent(f"Rollback timer must be between {ROLLBACK_TIMER_MIN} and {ROLLBACK_TIMER_MAX} minutes.", "error"))
-            return
+def main() -> None:
+    """Run the Rich CLI."""
+    setup_logging()
+    set_status_callback(print_status)
 
-        run_config = RunConfig(username=username, password=password, rollback_timer=rollback_timer)
-        self.run_in_progress = True
-        self.query_one("#run", Button).disabled = True
-        self.query_one("#summary", Static).update("Loading configuration files...")
-        self.query_one("#results", DataTable).clear()
-        self.query_one("#progress", ProgressBar).update(total=1, progress=0)
-        self.query_one("#events", Log).clear()
-        self.add_status(StatusEvent("Run started.", "info"))
-
-        self.worker_thread = threading.Thread(
-            target=self.run_configuration,
-            args=(run_config,),
-            name="config-runner",
-            daemon=True,
-        )
-        self.worker_thread.start()
-
-    def post_status_from_worker(self, event: StatusEvent) -> None:
-        try:
-            self.call_from_thread(self.add_status, event)
-        except RuntimeError:
-            self.add_status(event)
-
-    def add_status(self, event: StatusEvent) -> None:
-        prefix = {
-            "success": "OK",
-            "warning": "WARN",
-            "error": "FAIL",
-            "info": "INFO",
-        }.get(event.level, "INFO")
-        message = f"{prefix}: {event.message}"
-        self.query_one("#events", Log).write_line(message)
-
-    def run_configuration(self, run_config: RunConfig) -> None:
-        setup_logging()
+    try:
+        run_config = prompt_run_config()
         configurator = SwitchConfigurator(run_config.username, run_config.password, run_config.rollback_timer)
 
-        try:
-            switches = configurator.load_switches(run_config.switches_file)
-            commands = configurator.load_commands(run_config.commands_file)
-            configurator.load_prompt_handlers(run_config.prompt_file)
+        console.print()
+        console.print("[bold]Loading configuration files...[/bold]")
+        switches = configurator.load_switches(run_config.switches_file)
+        commands = configurator.load_commands(run_config.commands_file)
+        configurator.load_prompt_handlers(run_config.prompt_file)
 
-            if not switches:
-                raise ConfigError("No switches to configure")
-            if not commands:
-                raise ConfigError("No commands to execute")
+        if not switches:
+            raise ConfigError("No switches to configure")
+        if not commands:
+            raise ConfigError("No commands to execute")
 
-            max_workers = min(run_config.max_workers, len(switches))
-            self.call_from_thread(
-                self.prepare_execution,
-                len(switches),
-                len(commands),
-                len(configurator.prompt_handlers),
-                run_config.rollback_timer,
-                max_workers,
-            )
+        max_workers = min(run_config.max_workers, len(switches))
+        console.print()
+        console.print(build_summary_table(
+            len(switches),
+            len(commands),
+            len(configurator.prompt_handlers),
+            run_config.rollback_timer,
+            max_workers,
+        ))
+
+        console.print()
+        if not Confirm.ask("[bold yellow]Proceed with configuration?[/bold yellow]", default=False):
+            console.print("[cyan]Configuration cancelled.[/cyan]")
+            return
+
+        console.print()
+        results: List[SwitchResult] = []
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task(f"Configuring {len(switches)} switches", total=len(switches))
+
+            def update_progress() -> None:
+                with console_lock:
+                    progress.update(task, advance=1)
 
             results = configurator.run_switches(
                 switches,
                 max_workers=max_workers,
-                progress_callback=lambda: self.call_from_thread(self.advance_progress),
-            )
-            self.call_from_thread(self.finish_run, results)
-        except Exception as e:
-            logger.exception("Run failed")
-            self.call_from_thread(self.fail_run, str(e))
-
-    def prepare_execution(self, switch_count: int, command_count: int, handler_count: int, rollback_timer: int, max_workers: int) -> None:
-        summary = (
-            f"{switch_count} switches | {command_count} commands | "
-            f"{handler_count} prompt handlers | rollback {rollback_timer} min | {max_workers} workers"
-        )
-        self.query_one("#summary", Static).update(summary)
-        self.query_one("#progress", ProgressBar).update(total=switch_count, progress=0)
-        self.add_status(StatusEvent("Configuration files validated. Starting SSH sessions.", "success"))
-
-    def advance_progress(self) -> None:
-        self.query_one("#progress", ProgressBar).advance(1)
-
-    def finish_run(self, results: Sequence[SwitchResult]) -> None:
-        table = self.query_one("#results", DataTable)
-        table.clear()
-        for result in results:
-            table.add_row(
-                "OK" if result.success else "FAIL",
-                result.hostname,
-                result.ip,
-                result.vendor,
-                result.error,
+                progress_callback=update_progress,
             )
 
-        success_count = sum(1 for result in results if result.success)
-        total = len(results)
-        if success_count == total:
-            summary = f"Complete: all {total} switches configured successfully."
-            level = "success"
-        elif success_count:
-            summary = f"Complete: {success_count}/{total} switches configured successfully."
-            level = "warning"
-        else:
-            summary = "Complete: all switch configurations failed."
-            level = "error"
-
-        self.query_one("#summary", Static).update(summary)
-        self.add_status(StatusEvent(summary, level))
-        self.run_in_progress = False
-        self.query_one("#run", Button).disabled = False
-
-    def fail_run(self, error: str) -> None:
-        self.query_one("#summary", Static).update(f"Run failed: {error}")
-        self.add_status(StatusEvent(error, "error"))
-        self.run_in_progress = False
-        self.query_one("#run", Button).disabled = False
-
-
-def main() -> None:
-    """Run the Textual TUI."""
-    SwitchConfiguratorApp().run()
+        console.print()
+        console.print(build_results_table(results))
+        console.print()
+        print_final_summary(results)
+    finally:
+        set_status_callback(None)
 
 
 if __name__ == '__main__':

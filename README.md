@@ -1,6 +1,6 @@
 # Network Switch Configurator
 
-Textual-based SSH automation for bulk switch configuration with timed rollback protection for Aruba AOS-CX and Cisco IOS XE.
+Rich-formatted SSH automation for bulk switch configuration with timed rollback protection for Aruba AOS-CX and Cisco IOS XE.
 
 ## What It Does
 
@@ -161,7 +161,7 @@ delete|YES
 
 ## Usage
 
-Run the Textual interface:
+Run the Rich interface:
 
 ```bash
 venv/bin/python switch_configurator.py
@@ -216,4 +216,4 @@ Compile check:
 venv/bin/python -m compileall -q switch_configurator.py tests/test_switch_configurator.py
 ```
 
-The test suite covers command template parsing, loader validation, prompt handling, vendor rollback flows, runner result handling, logging setup, and headless Textual app mounting.
+The test suite covers command template parsing, loader validation, prompt handling, vendor rollback flows, runner result handling, logging setup, and Rich table rendering.
