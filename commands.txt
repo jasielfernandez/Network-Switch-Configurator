@@ -30,6 +30,11 @@
 #     interface 1/{i}/48
 #   #ENDFOR
 #
+# SLEEP - Pause before the next command (whole or decimal seconds, max 300):
+#   apply fault-monitor profile stormcontrol50
+#   #SLEEP 5
+#   no shutdown
+#
 # Operators: ==, !=, >, <, >=, <=
 # Logical: AND, OR
 #

@@ -11,6 +11,7 @@ import logging
 from pathlib import Path
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -71,6 +72,15 @@ THREAD_TIMEOUT = 600  # 10 minutes per switch
 # minutes, but Aruba AOS-CX checkpoint auto is documented at 1-60 minutes.
 ROLLBACK_TIMER_MIN = 1
 ROLLBACK_TIMER_MAX = 60
+
+# Maximum duration (seconds) allowed for a single #SLEEP directive. Kept well under
+# THREAD_TIMEOUT (600s) and the rollback/checkpoint window so a pause cannot trigger
+# an auto-revert or a per-switch timeout on its own.
+MAX_SLEEP_SECONDS = 300
+
+# Sentinel prefix emitted when a #SLEEP node is rendered into the flat command list.
+# Device CLI commands never start with '#', so this cannot collide with a real command.
+SLEEP_TOKEN_PREFIX = "#SLEEP "
 
 # Common command output errors caught after Netmiko command execution
 ERROR_INDICATORS = (
@@ -173,7 +183,13 @@ class ForBlock:
     body: Tuple["CommandNode", ...]
 
 
-CommandNode = Union[TextCommand, IfBlock, ForBlock]
+@dataclass(frozen=True)
+class SleepCommand:
+    seconds: float
+    raw: str  # original numeric text, preserved for a clean rendered token
+
+
+CommandNode = Union[TextCommand, IfBlock, ForBlock, SleepCommand]
 
 
 def set_status_callback(callback: Optional[Callable[[StatusEvent], None]]) -> None:
@@ -301,7 +317,7 @@ class SwitchConfigurator:
         """Load commands from text file"""
         try:
             # Directive keywords that should be preserved
-            directives = ['#IF ', '#ELSE', '#ENDIF', '#FOR ', '#ENDFOR']
+            directives = ['#IF ', '#ELSE', '#ENDIF', '#FOR ', '#ENDFOR', '#SLEEP ']
 
             commands: List[str] = []
             with open(commands_file, 'r', encoding='utf-8') as f:
@@ -704,6 +720,22 @@ class SwitchConfigurator:
                 i = next_index + 1
                 continue
 
+            if line == '#SLEEP' or line.startswith('#SLEEP '):
+                arg = line[len('#SLEEP'):].strip()
+                try:
+                    seconds = float(arg)
+                except ValueError:
+                    raise CommandSyntaxError(f"Invalid #SLEEP duration at line {i + 1}: {arg!r}")
+                if seconds < 0:
+                    raise CommandSyntaxError(f"#SLEEP duration cannot be negative at line {i + 1}")
+                if seconds > MAX_SLEEP_SECONDS:
+                    raise CommandSyntaxError(
+                        f"#SLEEP duration {seconds}s exceeds maximum {MAX_SLEEP_SECONDS}s at line {i + 1}"
+                    )
+                nodes.append(SleepCommand(seconds=seconds, raw=arg))
+                i += 1
+                continue
+
             if line.startswith(('#ELSE', '#ENDIF', '#ENDFOR')):
                 raise CommandSyntaxError(f"Unexpected directive at line {i + 1}: {line}")
 
@@ -731,6 +763,8 @@ class SwitchConfigurator:
         for node in nodes:
             if isinstance(node, TextCommand):
                 result.append(node.text)
+            elif isinstance(node, SleepCommand):
+                result.append(f"{SLEEP_TOKEN_PREFIX}{node.raw}")
             elif isinstance(node, IfBlock):
                 branch = node.if_body if self._evaluate_condition(node.condition, switch) else node.else_body
                 result.extend(self._render_command_nodes(branch, switch))
@@ -988,6 +1022,18 @@ class SwitchConfigurator:
             pending_batch = []
 
         for cmd in commands:
+            if cmd.startswith(SLEEP_TOKEN_PREFIX):
+                seconds = float(cmd[len(SLEEP_TOKEN_PREFIX):].strip())
+                flush_pending_batch()  # ensure prior commands reach the device before pausing
+                if seconds >= self.rollback_timer * 60:
+                    thread_safe_print(
+                        f"WARNING: #SLEEP {seconds}s is >= the rollback window "
+                        f"({self.rollback_timer} min); configuration may auto-revert"
+                    )
+                thread_safe_print(f"INFO: Sleeping {seconds}s before next command...")
+                time.sleep(seconds)
+                continue
+
             if self.get_prompt_response(cmd) is None:
                 pending_batch.append(cmd)
                 continue

@@ -9,6 +9,7 @@ from switch_configurator import (
     CommandSyntaxError,
     ConfigError,
     DeviceExecutionError,
+    MAX_SLEEP_SECONDS,
     SwitchConfigurator,
     SwitchRecord,
     SwitchResult,
@@ -121,6 +122,78 @@ class ExecuteConfigurationCommandsTests(unittest.TestCase):
         connection.send_config_set.assert_called_once_with(
             ["hostname test"],
             enter_config_mode=False,
+            exit_config_mode=False,
+            cmd_verify=False,
+            read_timeout=240,
+        )
+
+    @patch("switch_configurator.time.sleep")
+    def test_sleep_token_pauses_and_flushes_batch_between_commands(self, mock_sleep):
+        connection = MagicMock()
+        connection.send_config_set.side_effect = ["hostname applied", "logging applied"]
+
+        output = self.configurator.execute_configuration_commands(
+            connection,
+            ["hostname test", "#SLEEP 5", "logging buffered 16384"],
+            already_in_config_mode=False,
+        )
+
+        mock_sleep.assert_called_once_with(5.0)
+        self.assertIn("hostname applied", output)
+        self.assertIn("logging applied", output)
+        # Two separate batches: the pending batch is flushed before the pause.
+        self.assertEqual(
+            connection.send_config_set.call_args_list,
+            [
+                unittest.mock.call(
+                    ["hostname test"],
+                    enter_config_mode=True,
+                    exit_config_mode=False,
+                    cmd_verify=False,
+                    read_timeout=240,
+                ),
+                unittest.mock.call(
+                    ["logging buffered 16384"],
+                    enter_config_mode=False,
+                    exit_config_mode=False,
+                    cmd_verify=False,
+                    read_timeout=240,
+                ),
+            ],
+        )
+        # The sleep token must never be sent to the device.
+        for call in connection.send_config_set.call_args_list:
+            self.assertNotIn("#SLEEP 5", call.args[0])
+
+    @patch("switch_configurator.time.sleep")
+    def test_sleep_token_accepts_decimal_seconds(self, mock_sleep):
+        connection = MagicMock()
+        connection.send_config_set.return_value = "hostname applied"
+
+        self.configurator.execute_configuration_commands(
+            connection,
+            ["hostname test", "#SLEEP 2.5"],
+            already_in_config_mode=False,
+        )
+
+        mock_sleep.assert_called_once_with(2.5)
+
+    @patch("switch_configurator.time.sleep")
+    def test_leading_and_trailing_sleep_tokens_do_not_error(self, mock_sleep):
+        connection = MagicMock()
+        connection.send_config_set.return_value = "hostname applied"
+
+        output = self.configurator.execute_configuration_commands(
+            connection,
+            ["#SLEEP 1", "hostname test", "#SLEEP 1"],
+            already_in_config_mode=False,
+        )
+
+        self.assertIn("hostname applied", output)
+        self.assertEqual(mock_sleep.call_count, 2)
+        connection.send_config_set.assert_called_once_with(
+            ["hostname test"],
+            enter_config_mode=True,
             exit_config_mode=False,
             cmd_verify=False,
             read_timeout=240,
@@ -586,6 +659,78 @@ class ConditionalLogicTests(unittest.TestCase):
     def test_unexpected_else_raises_command_syntax_error(self):
         with self.assertRaises(CommandSyntaxError):
             self.configurator.compile_command_template(["#ELSE"])
+
+    def test_sleep_directive_renders_as_token(self):
+        """#SLEEP renders to a sentinel token in the flat command list"""
+        commands = [
+            "hostname test",
+            "#SLEEP 5",
+            "logging buffered 16384",
+        ]
+
+        result = self.configurator.parse_commands_with_conditionals(commands, {})
+
+        self.assertEqual(
+            result,
+            ["hostname test", "#SLEEP 5", "logging buffered 16384"],
+        )
+
+    def test_sleep_directive_preserves_decimal_seconds(self):
+        """#SLEEP keeps decimal durations intact"""
+        result = self.configurator.parse_commands_with_conditionals(["#SLEEP 2.5"], {})
+
+        self.assertEqual(result, ["#SLEEP 2.5"])
+
+    def test_sleep_inside_for_loop_repeats_each_iteration(self):
+        """A #SLEEP inside a #FOR is emitted once per iteration"""
+        commands = [
+            "#FOR i IN 2",
+            "interface {i}/0/1",
+            "#SLEEP 1",
+            "#ENDFOR",
+        ]
+
+        result = self.configurator.parse_commands_with_conditionals(commands, {})
+
+        self.assertEqual(
+            result,
+            ["interface 1/0/1", "#SLEEP 1", "interface 2/0/1", "#SLEEP 1"],
+        )
+
+    def test_sleep_inside_if_only_renders_for_taken_branch(self):
+        """A #SLEEP inside a #IF appears only when its branch is taken"""
+        commands = [
+            "#IF {vendor} == cisco",
+            "#SLEEP 3",
+            "#ELSE",
+            "#SLEEP 9",
+            "#ENDIF",
+        ]
+
+        self.assertEqual(
+            self.configurator.parse_commands_with_conditionals(commands, {"vendor": "cisco"}),
+            ["#SLEEP 3"],
+        )
+        self.assertEqual(
+            self.configurator.parse_commands_with_conditionals(commands, {"vendor": "aruba"}),
+            ["#SLEEP 9"],
+        )
+
+    def test_sleep_missing_duration_raises_command_syntax_error(self):
+        with self.assertRaises(CommandSyntaxError):
+            self.configurator.compile_command_template(["#SLEEP "])
+
+    def test_sleep_non_numeric_duration_raises_command_syntax_error(self):
+        with self.assertRaises(CommandSyntaxError):
+            self.configurator.compile_command_template(["#SLEEP abc"])
+
+    def test_sleep_negative_duration_raises_command_syntax_error(self):
+        with self.assertRaises(CommandSyntaxError):
+            self.configurator.compile_command_template(["#SLEEP -5"])
+
+    def test_sleep_over_maximum_raises_command_syntax_error(self):
+        with self.assertRaises(CommandSyntaxError):
+            self.configurator.compile_command_template([f"#SLEEP {MAX_SLEEP_SECONDS + 1}"])
 
 
 class LoaderTests(unittest.TestCase):

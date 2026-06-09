@@ -134,6 +134,23 @@ Supported logical operators:
 - `AND`
 - `OR`
 
+Delays:
+
+```text
+interface 1/1/1
+apply fault-monitor profile stormcontrol50
+#SLEEP 5
+no shutdown
+```
+
+`#SLEEP <seconds>` pauses before the next command runs — useful when a device needs a
+moment to settle after enabling a feature or applying a profile. Any pending commands are
+sent to the device before the pause. Durations may be whole or decimal seconds
+(`#SLEEP 5`, `#SLEEP 2.5`), from `0` up to a maximum of 300 seconds; an invalid or
+out-of-range value fails before any SSH connection is opened. A `#SLEEP` inside a `#FOR`
+loop runs on every iteration. Note that the pause counts against the rollback/checkpoint
+window, so keep total sleep time well under your configured rollback timer.
+
 Invalid template syntax fails before SSH connections are opened.
 
 ### `prompthandling.txt`
