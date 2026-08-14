@@ -68,6 +68,14 @@ MAX_LOOP_ITERATIONS = 10000
 # Maximum time (in seconds) to wait for a single switch configuration
 THREAD_TIMEOUT = 600  # 10 minutes per switch
 
+# SSH connection retry settings. TACACS+/RADIUS-backed devices can stall or
+# reject logins for a few seconds while the AAA server responds, which shows
+# up as an immediate authentication failure. Retry with a pause before giving
+# up on a switch. Kept modest so repeated attempts with genuinely bad
+# credentials do not trip account lockout policies.
+CONNECT_ATTEMPTS = 3
+CONNECT_RETRY_DELAY = 10  # seconds between connection attempts
+
 # The UI uses the cross-platform timer range. Cisco IOS XE supports up to 120
 # minutes, but Aruba AOS-CX checkpoint auto is documented at 1-60 minutes.
 ROLLBACK_TIMER_MIN = 1
@@ -801,6 +809,11 @@ class SwitchConfigurator:
                 # If a variable is missing, keep the command as-is and warn
                 thread_safe_print(f"WARNING: Variable {str(e)} not found in CSV for command: {str(cmd)}")
                 substituted.append(cmd)
+            except (IndexError, ValueError) as e:
+                # Literal braces (e.g. in banner text) break str.format_map;
+                # send the command unchanged instead of failing the switch.
+                thread_safe_print(f"WARNING: Could not substitute variables ({str(e)}) for command: {str(cmd)}")
+                substituted.append(cmd)
         return substituted
 
     def parse_commands_with_conditionals(self, commands: Sequence[str], switch: Mapping[str, Any]) -> List[str]:
@@ -929,6 +942,38 @@ class SwitchConfigurator:
         except (ValueError, TypeError):
             thread_safe_print(f"WARNING: Invalid loop count '{count_expr}', using 0")
             return 0
+
+    def _connect_with_retries(self, device: Dict[str, Any], hostname: str) -> BaseConnection:
+        """Open an SSH connection, retrying transient auth/timeout failures.
+
+        TACACS+ authorization can take several seconds; while the AAA server is
+        slow or briefly overloaded the device may reject the login outright. A
+        short pause and retry usually succeeds, so only give up after
+        CONNECT_ATTEMPTS tries.
+        """
+        last_error: Exception = RuntimeError("No connection attempts made")
+        for attempt in range(1, CONNECT_ATTEMPTS + 1):
+            try:
+                if attempt > 1:
+                    thread_safe_print(
+                        f"INFO: Retrying connection to {hostname} (attempt {attempt}/{CONNECT_ATTEMPTS})..."
+                    )
+                return cast(BaseConnection, ConnectHandler(**device))
+            except (NetmikoAuthenticationException, NetmikoTimeoutException) as e:
+                last_error = e
+                kind = (
+                    "Authentication failed"
+                    if isinstance(e, NetmikoAuthenticationException)
+                    else "Connection timeout"
+                )
+                logger.debug("Connection attempt %s/%s to %s failed: %s", attempt, CONNECT_ATTEMPTS, hostname, e)
+                if attempt < CONNECT_ATTEMPTS:
+                    thread_safe_print(
+                        f"WARNING: {kind} for {hostname} on attempt {attempt}/{CONNECT_ATTEMPTS}; "
+                        f"waiting {CONNECT_RETRY_DELAY}s before retry (AAA server may be slow)"
+                    )
+                    time.sleep(CONNECT_RETRY_DELAY)
+        raise last_error
 
     def _safe_disconnect(self, connection: Optional[BaseConnection], hostname: str) -> None:
         """Safely disconnect with proper error handling and resource cleanup"""
@@ -1085,7 +1130,7 @@ class SwitchConfigurator:
         try:
             # Connect to device
             thread_safe_print(f"INFO: Establishing SSH connection...")
-            connection = ConnectHandler(**device)
+            connection = self._connect_with_retries(device, hostname)
             thread_safe_print(f"SUCCESS: Connected to {hostname}")
 
             parsed_commands = self.render_command_template(switch_context)
@@ -1116,11 +1161,15 @@ class SwitchConfigurator:
             return success
 
         except NetmikoTimeoutException:
-            thread_safe_print(f"ERROR: Connection timeout to {hostname} ({ip_address})")
+            thread_safe_print(
+                f"ERROR: Connection timeout to {hostname} ({ip_address}) after {CONNECT_ATTEMPTS} attempts"
+            )
             self._safe_disconnect(connection, hostname)
             return False
         except NetmikoAuthenticationException:
-            thread_safe_print(f"ERROR: Authentication failed to {hostname} ({ip_address})")
+            thread_safe_print(
+                f"ERROR: Authentication failed to {hostname} ({ip_address}) after {CONNECT_ATTEMPTS} attempts"
+            )
             self._safe_disconnect(connection, hostname)
             return False
         except Exception as e:
