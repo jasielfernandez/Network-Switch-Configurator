@@ -12,6 +12,14 @@ Rich-formatted SSH automation for bulk switch configuration with timed rollback 
 - Handles selected interactive command prompts from `prompthandling.txt`.
 - Writes concise run logs and complete device output to `logs/switch_configurator.log`.
 
+## Connection Behavior
+
+SSH logins on TACACS+/RADIUS-backed devices can stall or fail for a few seconds while
+the AAA server responds. The configurator retries each switch connection up to 3 times,
+waiting 10 seconds between attempts, before marking the switch as failed. Both
+authentication failures and connection timeouts are retried; the attempt count is kept
+low so a genuinely wrong password does not trip account lockout policies.
+
 ## Platform Behavior
 
 ### Aruba AOS-CX

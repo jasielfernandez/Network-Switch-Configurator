@@ -5,7 +5,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
+from netmiko import NetmikoAuthenticationException, NetmikoTimeoutException
+
 from switch_configurator import (
+    CONNECT_ATTEMPTS,
+    CONNECT_RETRY_DELAY,
     CommandSyntaxError,
     ConfigError,
     DeviceExecutionError,
@@ -872,6 +876,98 @@ class VendorFlowTests(unittest.TestCase):
 
         self.assertFalse(success)
         connection.exit_config_mode.assert_called_once()
+
+
+class ConnectionRetryTests(unittest.TestCase):
+    def setUp(self):
+        self.configurator = SwitchConfigurator("user", "pass")
+        self.device = {"device_type": "aruba_aoscx", "host": "10.0.0.1"}
+
+    @patch("switch_configurator.time.sleep")
+    @patch("switch_configurator.ConnectHandler")
+    def test_auth_failure_retries_after_delay_then_succeeds(self, mock_connect, mock_sleep):
+        connection = MagicMock()
+        mock_connect.side_effect = [
+            NetmikoAuthenticationException("auth failed"),
+            connection,
+        ]
+
+        result = self.configurator._connect_with_retries(self.device, "sw1")
+
+        self.assertIs(result, connection)
+        self.assertEqual(mock_connect.call_count, 2)
+        mock_sleep.assert_called_once_with(CONNECT_RETRY_DELAY)
+
+    @patch("switch_configurator.time.sleep")
+    @patch("switch_configurator.ConnectHandler")
+    def test_timeout_retries_after_delay_then_succeeds(self, mock_connect, mock_sleep):
+        connection = MagicMock()
+        mock_connect.side_effect = [
+            NetmikoTimeoutException("timed out"),
+            connection,
+        ]
+
+        result = self.configurator._connect_with_retries(self.device, "sw1")
+
+        self.assertIs(result, connection)
+        mock_sleep.assert_called_once_with(CONNECT_RETRY_DELAY)
+
+    @patch("switch_configurator.time.sleep")
+    @patch("switch_configurator.ConnectHandler")
+    def test_gives_up_after_max_attempts_and_raises_last_error(self, mock_connect, mock_sleep):
+        mock_connect.side_effect = NetmikoAuthenticationException("auth failed")
+
+        with self.assertRaises(NetmikoAuthenticationException):
+            self.configurator._connect_with_retries(self.device, "sw1")
+
+        self.assertEqual(mock_connect.call_count, CONNECT_ATTEMPTS)
+        self.assertEqual(mock_sleep.call_count, CONNECT_ATTEMPTS - 1)
+
+    @patch("switch_configurator.time.sleep")
+    @patch("switch_configurator.ConnectHandler")
+    def test_first_attempt_success_does_not_sleep(self, mock_connect, mock_sleep):
+        connection = MagicMock()
+        mock_connect.return_value = connection
+
+        result = self.configurator._connect_with_retries(self.device, "sw1")
+
+        self.assertIs(result, connection)
+        mock_connect.assert_called_once()
+        mock_sleep.assert_not_called()
+
+    @patch("switch_configurator.time.sleep")
+    @patch("switch_configurator.ConnectHandler")
+    def test_configure_switch_returns_false_after_exhausted_auth_retries(self, mock_connect, mock_sleep):
+        mock_connect.side_effect = NetmikoAuthenticationException("auth failed")
+        self.configurator.commands = ("hostname test",)
+        self.configurator.command_template = self.configurator.compile_command_template(["hostname test"])
+
+        switch = SwitchRecord.from_mapping(
+            {"switchname": "sw1", "ip address": "10.0.0.1", "vendor": "aruba"}
+        )
+
+        self.assertFalse(self.configurator.configure_switch(switch))
+        self.assertEqual(mock_connect.call_count, CONNECT_ATTEMPTS)
+
+
+class VariableSubstitutionTests(unittest.TestCase):
+    def setUp(self):
+        self.configurator = SwitchConfigurator("user", "pass")
+
+    def test_missing_variable_keeps_command_and_warns(self):
+        result = self.configurator.substitute_variables(["vlan {missing}"], {})
+
+        self.assertEqual(result, ["vlan {missing}"])
+
+    def test_literal_unmatched_brace_keeps_command(self):
+        result = self.configurator.substitute_variables(["banner motd { welcome"], {})
+
+        self.assertEqual(result, ["banner motd { welcome"])
+
+    def test_empty_braces_keep_command(self):
+        result = self.configurator.substitute_variables(["set text {}"], {})
+
+        self.assertEqual(result, ["set text {}"])
 
 
 class RunnerTests(unittest.TestCase):
