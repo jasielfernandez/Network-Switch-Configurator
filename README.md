@@ -20,6 +20,24 @@ waiting 10 seconds between attempts, before marking the switch as failed. Both
 authentication failures and connection timeouts are retried; the attempt count is kept
 low so a genuinely wrong password does not trip account lockout policies.
 
+## Long-Running and Oversized Commands
+
+Some commands keep a switch busy long after the text has been sent — a large payload
+the device must decode and validate (an AOS-CX `nae-script` body, for example), or a
+`write memory` still committing to flash. Two behaviors handle this:
+
+- Any command longer than 1024 characters is sent on its own rather than inside a
+  batch, and the configurator waits up to 300 seconds for the switch to return a
+  prompt before continuing. Command echo verification is disabled for these lines
+  because a switch wraps a command this long, which makes the echo unmatchable.
+- Leaving configuration mode drains buffered device output first and retries up to
+  3 times. Without this, output still arriving from a slow command is misread as
+  "still in configuration mode", and the run aborts *before* the checkpoint is
+  confirmed — which silently auto-reverts a configuration that actually applied.
+
+Status lines truncate commands at 120 characters so a large payload stays readable in
+the terminal. The full command text is written to the log file.
+
 ## Platform Behavior
 
 ### Aruba AOS-CX
