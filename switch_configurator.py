@@ -90,6 +90,28 @@ MAX_SLEEP_SECONDS = 300
 # Device CLI commands never start with '#', so this cannot collide with a real command.
 SLEEP_TOKEN_PREFIX = "#SLEEP "
 
+# Leaving configuration mode is retried because Netmiko decides whether it is
+# still in config mode by reading the prompt. A command that keeps the switch
+# busy after Netmiko has stopped reading -- a large payload the device must
+# decode and validate, or a 'write memory' still committing to flash -- leaves
+# echoed config prompts in the SSH channel. exit_config_mode() reads that stale
+# output and concludes it never left. Draining the channel first and retrying
+# resolves it. This matters: an exception here skips the checkpoint/revert
+# confirmation, so an already-applied configuration silently auto-reverts.
+CONFIG_EXIT_ATTEMPTS = 3
+CONFIG_EXIT_SETTLE_SECONDS = 15
+
+# Commands longer than this are sent on their own instead of inside a batch. A
+# switch can spend many seconds decoding and validating a large payload (an NAE
+# script body, for example), and batching it means the remaining commands are
+# written into the channel while the device is still busy.
+LARGE_COMMAND_THRESHOLD = 1024
+LARGE_COMMAND_READ_TIMEOUT = 300
+
+# Operator-facing status lines truncate commands at this length. A multi-kilobyte
+# payload is unreadable in a terminal; the full text still reaches the log file.
+COMMAND_DISPLAY_LIMIT = 120
+
 # Common command output errors caught after Netmiko command execution
 ERROR_INDICATORS = (
     "% invalid",
@@ -261,6 +283,13 @@ def validate_no_command_errors(output: str, context: str) -> None:
     error_line = find_error_line(output)
     if error_line:
         raise DeviceExecutionError(f"{context} failed: {error_line}")
+
+
+def summarize_command(command: str, limit: int = COMMAND_DISPLAY_LIMIT) -> str:
+    """Shorten a command for operator-facing status output."""
+    if len(command) <= limit:
+        return command
+    return f"{command[:limit]}... [{len(command)} chars total]"
 
 
 def output_indicates_save_success(output: str) -> bool:
@@ -522,7 +551,7 @@ class SwitchConfigurator:
                 raise
 
             # Exit config mode
-            connection.exit_config_mode()
+            self._exit_config_mode_safely(connection)
 
             # Confirm the auto checkpoint to save changes permanently
             thread_safe_print("SUCCESS: Configuration applied")
@@ -576,7 +605,10 @@ class SwitchConfigurator:
 
         except Exception as e:
             thread_safe_print(f"ERROR: Failed during Aruba CX configuration: {str(e)}")
-            thread_safe_print("INFO: Checkpoint will auto-revert if active...")
+            thread_safe_print(
+                f"WARNING: The checkpoint was not confirmed, so the switch will auto-revert "
+                f"this configuration within {self.rollback_timer} minutes"
+            )
             return False, output + f"\nERROR: {str(e)}"
 
     def configure_cisco_ios_xe(self, connection: BaseConnection, commands: List[str]) -> Tuple[bool, str]:
@@ -617,7 +649,7 @@ class SwitchConfigurator:
             output += self.execute_configuration_commands(connection, commands, already_in_config_mode=True)
 
             # Exit config mode
-            connection.exit_config_mode()
+            self._exit_config_mode_safely(connection)
 
             # Automatically confirm changes
             thread_safe_print("SUCCESS: Configuration applied")
@@ -646,7 +678,10 @@ class SwitchConfigurator:
 
         except Exception as e:
             thread_safe_print(f"ERROR: Failed during Cisco IOS XE configuration: {str(e)}")
-            thread_safe_print("INFO: Configuration will auto-revert if active...")
+            thread_safe_print(
+                f"WARNING: The change was not confirmed, so the switch will auto-revert "
+                f"this configuration within {self.rollback_timer} minutes"
+            )
             return False, output + f"\nERROR: {str(e)}"
 
     def compile_command_template(self, commands: Sequence[str]) -> Tuple[CommandNode, ...]:
@@ -975,6 +1010,51 @@ class SwitchConfigurator:
                     time.sleep(CONNECT_RETRY_DELAY)
         raise last_error
 
+    def _drain_channel(self, connection: BaseConnection, context: str) -> None:
+        """Absorb device output still in flight so the next prompt read is current."""
+        try:
+            # Returns once the device has been quiet briefly, or at the timeout,
+            # so a switch still working on the previous command gets to finish.
+            drained = connection.read_channel_timing(read_timeout=CONFIG_EXIT_SETTLE_SECONDS)
+        except Exception as e:
+            logger.debug("Channel drain during %s failed: %s", context, e)
+            return
+        if isinstance(drained, str) and drained.strip():
+            log_device_output(f"Drained channel during {context}", drained)
+
+    def _exit_config_mode_safely(self, connection: BaseConnection) -> None:
+        """Leave configuration mode, tolerating a backlog of buffered device output.
+
+        See CONFIG_EXIT_ATTEMPTS for why a plain exit_config_mode() call is not
+        reliable after a long-running configuration command.
+        """
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, CONFIG_EXIT_ATTEMPTS + 1):
+            self._drain_channel(connection, f"config mode exit attempt {attempt}")
+            try:
+                connection.exit_config_mode()
+                if attempt > 1:
+                    thread_safe_print(
+                        f"INFO: Left configuration mode on attempt {attempt}/{CONFIG_EXIT_ATTEMPTS}"
+                    )
+                return
+            except Exception as e:
+                last_error = e
+                logger.debug(
+                    "exit_config_mode attempt %s/%s failed: %s", attempt, CONFIG_EXIT_ATTEMPTS, e
+                )
+                if attempt < CONFIG_EXIT_ATTEMPTS:
+                    thread_safe_print(
+                        f"WARNING: Could not leave configuration mode (attempt "
+                        f"{attempt}/{CONFIG_EXIT_ATTEMPTS}); the switch may still be processing "
+                        f"the previous command. Retrying..."
+                    )
+
+        raise DeviceExecutionError(
+            f"Failed to exit configuration mode after {CONFIG_EXIT_ATTEMPTS} attempts: {last_error}"
+        )
+
     def _safe_disconnect(self, connection: Optional[BaseConnection], hostname: str) -> None:
         """Safely disconnect with proper error handling and resource cleanup"""
         if connection is None:
@@ -1027,10 +1107,31 @@ class SwitchConfigurator:
         except Exception as e:
             raise RuntimeError(f"ERROR executing '{command}': {str(e)}") from e
 
+    def execute_large_command(self, connection: BaseConnection, command: str) -> str:
+        """Send one oversized configuration line and wait for the device to finish.
+
+        Waits for the prompt rather than for the channel to go quiet, so a switch
+        that pauses mid-payload does not leave the session out of step.
+        """
+        logger.debug("Large command (%s chars): %s", len(command), command)
+        output: str = cast(str, connection.send_command(
+            command,
+            expect_string=r"#",
+            read_timeout=LARGE_COMMAND_READ_TIMEOUT,
+            strip_prompt=False,
+            strip_command=False,
+            # Echo verification matches the whole command text, which never matches
+            # once the switch wraps a line this long. Wait for the prompt instead.
+            cmd_verify=False,
+        ))
+        log_device_output(f"Large command ({len(command)} chars)", output)
+        validate_no_command_errors(output, "Large command execution")
+        return output
+
     def execute_configuration_batch(self, connection: BaseConnection, commands: List[str], *, enter_config_mode: bool) -> str:
         """Send a batch of non-interactive configuration commands through Netmiko config mode."""
         for cmd in commands:
-            thread_safe_print(f"COMMAND: {cmd}")
+            thread_safe_print(f"COMMAND: {summarize_command(cmd)}")
 
         output: str = cast(str, connection.send_config_set(
             commands,
@@ -1079,6 +1180,23 @@ class SwitchConfigurator:
                 time.sleep(seconds)
                 continue
 
+            # Checked before prompt handling so a large payload never gets routed
+            # into the interactive path: prompt keywords match anywhere in the
+            # command text, and a multi-kilobyte body can contain one by chance.
+            if len(cmd) > LARGE_COMMAND_THRESHOLD:
+                flush_pending_batch()
+                if not in_config_mode:
+                    connection.config_mode()
+                    in_config_mode = True
+
+                thread_safe_print(f"COMMAND: {summarize_command(cmd)}")
+                thread_safe_print(
+                    f"INFO: Sending {len(cmd)} character command on its own; "
+                    f"waiting up to {LARGE_COMMAND_READ_TIMEOUT}s for the switch to process it..."
+                )
+                output += self.execute_large_command(connection, cmd) + "\n"
+                continue
+
             if self.get_prompt_response(cmd) is None:
                 pending_batch.append(cmd)
                 continue
@@ -1088,7 +1206,7 @@ class SwitchConfigurator:
                 connection.config_mode()
                 in_config_mode = True
 
-            thread_safe_print(f"COMMAND: {cmd}")
+            thread_safe_print(f"COMMAND: {summarize_command(cmd)}")
             output += self.execute_command_with_prompts(connection, cmd, in_config_mode=True) + "\n"
 
         flush_pending_batch()

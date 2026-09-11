@@ -8,8 +8,11 @@ from unittest.mock import MagicMock, patch
 from netmiko import NetmikoAuthenticationException, NetmikoTimeoutException
 
 from switch_configurator import (
+    CONFIG_EXIT_ATTEMPTS,
     CONNECT_ATTEMPTS,
     CONNECT_RETRY_DELAY,
+    LARGE_COMMAND_READ_TIMEOUT,
+    LARGE_COMMAND_THRESHOLD,
     CommandSyntaxError,
     ConfigError,
     DeviceExecutionError,
@@ -19,6 +22,7 @@ from switch_configurator import (
     SwitchResult,
     build_results_table,
     logger,
+    summarize_command,
 )
 
 
@@ -876,6 +880,164 @@ class VendorFlowTests(unittest.TestCase):
 
         self.assertFalse(success)
         connection.exit_config_mode.assert_called_once()
+
+
+class ConfigModeExitTests(unittest.TestCase):
+    def setUp(self):
+        self.configurator = SwitchConfigurator("user", "pass")
+
+    def test_exit_drains_channel_before_reading_the_prompt(self):
+        connection = MagicMock()
+        connection.read_channel_timing.return_value = "sw(config)# "
+
+        self.configurator._exit_config_mode_safely(connection)
+
+        connection.read_channel_timing.assert_called_once()
+        connection.exit_config_mode.assert_called_once_with()
+
+    def test_exit_retries_after_a_stale_prompt_read(self):
+        connection = MagicMock()
+        connection.read_channel_timing.return_value = ""
+        connection.exit_config_mode.side_effect = [
+            ValueError("Failed to exit configuration mode"),
+            None,
+        ]
+
+        self.configurator._exit_config_mode_safely(connection)
+
+        self.assertEqual(connection.exit_config_mode.call_count, 2)
+        # The channel is drained again before the retry reads the prompt.
+        self.assertEqual(connection.read_channel_timing.call_count, 2)
+
+    def test_exit_raises_device_execution_error_after_max_attempts(self):
+        connection = MagicMock()
+        connection.read_channel_timing.return_value = ""
+        connection.exit_config_mode.side_effect = ValueError("Failed to exit configuration mode")
+
+        with self.assertRaises(DeviceExecutionError):
+            self.configurator._exit_config_mode_safely(connection)
+
+        self.assertEqual(connection.exit_config_mode.call_count, CONFIG_EXIT_ATTEMPTS)
+
+    def test_drain_failure_does_not_prevent_the_exit(self):
+        connection = MagicMock()
+        connection.read_channel_timing.side_effect = OSError("socket not ready")
+
+        self.configurator._exit_config_mode_safely(connection)
+
+        connection.exit_config_mode.assert_called_once_with()
+
+    def test_aruba_confirms_checkpoint_after_a_transient_exit_failure(self):
+        """A stale prompt read must not cost the switch its applied configuration."""
+        connection = MagicMock()
+        connection.read_channel_timing.return_value = ""
+        connection.exit_config_mode.side_effect = [
+            ValueError("Failed to exit configuration mode"),
+            None,
+        ]
+        connection.send_command.side_effect = [
+            "checkpoint started",
+            "checkpoint confirmed",
+        ]
+        connection.send_config_set.return_value = "config applied"
+
+        success, _output = self.configurator.configure_aruba_cx(connection, ["hostname test"])
+
+        self.assertTrue(success)
+        connection.send_command.assert_any_call(
+            "checkpoint auto confirm", read_timeout=120, expect_string=r".*#"
+        )
+
+
+class LargeCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.configurator = SwitchConfigurator("user", "pass")
+        self.large_command = "nae-script idle_port_reclaim false " + ("A" * LARGE_COMMAND_THRESHOLD)
+
+    def test_large_command_is_sent_alone_and_waits_for_the_prompt(self):
+        connection = MagicMock()
+        connection.send_command.return_value = "script installed"
+
+        output = self.configurator.execute_configuration_commands(
+            connection,
+            [self.large_command],
+            already_in_config_mode=True,
+        )
+
+        self.assertIn("script installed", output)
+        connection.send_command.assert_called_once_with(
+            self.large_command,
+            expect_string=r"#",
+            read_timeout=LARGE_COMMAND_READ_TIMEOUT,
+            strip_prompt=False,
+            strip_command=False,
+            cmd_verify=False,
+        )
+        connection.send_config_set.assert_not_called()
+
+    def test_large_command_flushes_the_pending_batch_first(self):
+        connection = MagicMock()
+        connection.send_config_set.side_effect = ["vlan applied", "trailing applied"]
+        connection.send_command.return_value = "script installed"
+
+        self.configurator.execute_configuration_commands(
+            connection,
+            ["vlan 1100", self.large_command, "logging buffered 16384"],
+            already_in_config_mode=True,
+        )
+
+        # Commands before and after the payload are batched separately, so the
+        # payload reaches the device on its own line with nothing queued behind it.
+        self.assertEqual(
+            [call.args[0] for call in connection.send_config_set.call_args_list],
+            [["vlan 1100"], ["logging buffered 16384"]],
+        )
+
+    def test_large_command_enters_config_mode_when_needed(self):
+        connection = MagicMock()
+        connection.send_command.return_value = "script installed"
+
+        self.configurator.execute_configuration_commands(
+            connection,
+            [self.large_command],
+            already_in_config_mode=False,
+        )
+
+        connection.config_mode.assert_called_once_with()
+
+    def test_large_command_bypasses_accidental_prompt_keyword_matches(self):
+        """Prompt keywords match anywhere in a command, including inside a payload."""
+        self.configurator.prompt_handlers = {"delete": "yes\n"}
+        payload = "nae-script demo false " + ("delete" * 400)
+        connection = MagicMock()
+        connection.send_command.return_value = "script installed"
+
+        self.configurator.execute_configuration_commands(
+            connection,
+            [payload],
+            already_in_config_mode=True,
+        )
+
+        connection.send_command_timing.assert_not_called()
+
+    def test_large_command_error_output_raises(self):
+        connection = MagicMock()
+        connection.send_command.return_value = "% Invalid input detected"
+
+        with self.assertRaises(DeviceExecutionError):
+            self.configurator.execute_configuration_commands(
+                connection,
+                [self.large_command],
+                already_in_config_mode=True,
+            )
+
+    def test_summarize_command_truncates_only_long_commands(self):
+        self.assertEqual(summarize_command("vlan 1100"), "vlan 1100")
+
+        summary = summarize_command("x" * 5000)
+
+        self.assertLess(len(summary), 200)
+        self.assertIn("5000 chars total", summary)
 
 
 class ConnectionRetryTests(unittest.TestCase):
