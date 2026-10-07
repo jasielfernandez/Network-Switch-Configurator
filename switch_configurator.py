@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 import logging
 from pathlib import Path
+import re
 import sys
 import threading
 import time
@@ -111,6 +112,13 @@ LARGE_COMMAND_READ_TIMEOUT = 300
 # Operator-facing status lines truncate commands at this length. A multi-kilobyte
 # payload is unreadable in a terminal; the full text still reaches the log file.
 COMMAND_DISPLAY_LIMIT = 120
+
+# Matches a {column} placeholder in commands.txt. A placeholder must start with
+# a letter or underscore; CSV headers here can contain spaces ("ip address"), so
+# spaces are allowed after that. Anything else between braces, and any unpaired
+# brace -- common in passwords and banner text -- does not match and is left
+# exactly as written.
+VARIABLE_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_ .\-]*)\}")
 
 # Common command output errors caught after Netmiko command execution
 ERROR_INDICATORS = (
@@ -832,23 +840,38 @@ class SwitchConfigurator:
         return result
 
     def substitute_variables(self, commands: Sequence[str], switch: Mapping[str, Any]) -> List[str]:
-        """Substitute variables in commands with values from switch CSV row"""
+        """Replace {column} placeholders with values from the switch CSV row.
+
+        Only a placeholder naming a real CSV column is replaced; every other
+        brace is left exactly as written. str.format_map cannot be used here
+        because device configuration legitimately contains braces -- a RADIUS
+        key or a banner, for example. An unpaired brace makes format_map raise
+        for the whole line, which would leave real placeholders on that line
+        unsubstituted and send a literal "{switchname}" to the switch.
+        """
         substituted = []
+
         for cmd in commands:
-            try:
-                # Use format_map for safe variable substitution
-                # This allows {column_name} syntax in commands
-                substituted_cmd = cmd.format_map(switch)
-                substituted.append(substituted_cmd)
-            except KeyError as e:
-                # If a variable is missing, keep the command as-is and warn
-                thread_safe_print(f"WARNING: Variable {str(e)} not found in CSV for command: {str(cmd)}")
-                substituted.append(cmd)
-            except (IndexError, ValueError) as e:
-                # Literal braces (e.g. in banner text) break str.format_map;
-                # send the command unchanged instead of failing the switch.
-                thread_safe_print(f"WARNING: Could not substitute variables ({str(e)}) for command: {str(cmd)}")
-                substituted.append(cmd)
+            unknown: List[str] = []
+
+            def replace(match: "re.Match[str]") -> str:
+                name = match.group(1)
+                if name in switch:
+                    return str(switch[name])
+                unknown.append(name)
+                return match.group(0)
+
+            substituted_cmd = VARIABLE_PATTERN.sub(replace, cmd)
+
+            if unknown:
+                names = ", ".join(sorted(set(unknown)))
+                thread_safe_print(
+                    f"WARNING: Variable(s) {names} not found in CSV; left as-is in command: "
+                    f"{summarize_command(cmd)}"
+                )
+
+            substituted.append(substituted_cmd)
+
         return substituted
 
     def parse_commands_with_conditionals(self, commands: Sequence[str], switch: Mapping[str, Any]) -> List[str]:

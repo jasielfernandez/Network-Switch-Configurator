@@ -1131,6 +1131,61 @@ class VariableSubstitutionTests(unittest.TestCase):
 
         self.assertEqual(result, ["set text {}"])
 
+    def test_closing_brace_in_a_password_is_left_alone(self):
+        """A RADIUS key or password may contain braces; they are not placeholders."""
+        command = "clearpass-password plaintext do~PmB]}password"
+
+        result = self.configurator.substitute_variables([command], {"vendor": "aruba"})
+
+        self.assertEqual(result, [command])
+
+    @patch("switch_configurator.thread_safe_print")
+    def test_literal_braces_do_not_warn(self, mock_print):
+        self.configurator.substitute_variables(
+            ["clearpass-password plaintext do~PmB]}password"], {"vendor": "aruba"}
+        )
+
+        mock_print.assert_not_called()
+
+    def test_literal_brace_does_not_block_other_variables_on_the_same_line(self):
+        """str.format_map raised for the whole line, sending a literal {switchname}."""
+        command = "radius-server host 10.0.0.1 key plaintext do~PmB]}pass name {switchname}-radius"
+
+        result = self.configurator.substitute_variables([command], {"switchname": "SW1"})
+
+        self.assertEqual(
+            result,
+            ["radius-server host 10.0.0.1 key plaintext do~PmB]}pass name SW1-radius"],
+        )
+
+    def test_column_name_containing_a_space_substitutes(self):
+        result = self.configurator.substitute_variables(
+            ["ip helper-address {ip address}"], {"ip address": "10.0.0.1"}
+        )
+
+        self.assertEqual(result, ["ip helper-address 10.0.0.1"])
+
+    def test_unknown_placeholder_warns_once_naming_the_variable(self):
+        with patch("switch_configurator.thread_safe_print") as mock_print:
+            self.configurator.substitute_variables(["vlan {nope} and {nope}"], {})
+
+        self.assertEqual(mock_print.call_count, 1)
+        self.assertIn("nope", mock_print.call_args.args[0])
+
+    def test_known_and_unknown_placeholders_are_handled_independently(self):
+        result = self.configurator.substitute_variables(
+            ["vlan {mgmt_vlan} name {nope}"], {"mgmt_vlan": "1100"}
+        )
+
+        self.assertEqual(result, ["vlan 1100 name {nope}"])
+
+    def test_brace_heavy_banner_text_is_preserved(self):
+        command = "banner motd ^{{WARNING}} authorized use only ^"
+
+        result = self.configurator.substitute_variables([command], {"vendor": "aruba"})
+
+        self.assertEqual(result, [command])
+
 
 class RunnerTests(unittest.TestCase):
     def setUp(self):
