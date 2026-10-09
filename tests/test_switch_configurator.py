@@ -899,6 +899,95 @@ class VendorFlowTests(unittest.TestCase):
         self.assertFalse(success)
         connection.exit_config_mode.assert_called_once()
 
+    def test_aruba_saves_startup_config_after_confirming(self):
+        """Confirming only cancels the revert; AOS-CX needs an explicit save."""
+        connection = mock_connection()
+        connection.send_command.side_effect = [
+            "checkpoint started",
+            "checkpoint confirmed",
+            "",
+        ]
+        connection.send_config_set.return_value = "config applied"
+
+        success, _output = self.configurator.configure_aruba_cx(connection, ["hostname test"])
+
+        self.assertTrue(success)
+        sent = [call.args[0] for call in connection.send_command.call_args_list]
+        self.assertEqual(sent[-2:], ["checkpoint auto confirm", "write memory"])
+
+    def test_aruba_save_is_not_sent_before_the_confirm(self):
+        """Saving first would persist a change a later revert could undo."""
+        connection = mock_connection()
+        connection.send_command.side_effect = [
+            "checkpoint started",
+            "checkpoint confirmed",
+            "",
+        ]
+        connection.send_config_set.return_value = "config applied"
+
+        self.configurator.configure_aruba_cx(connection, ["hostname test"])
+
+        sent = [call.args[0] for call in connection.send_command.call_args_list]
+        self.assertLess(sent.index("checkpoint auto confirm"), sent.index("write memory"))
+
+    def test_aruba_quiet_save_output_is_success(self):
+        """AOS-CX has no documented save banner, so silence is not failure."""
+        connection = mock_connection()
+        for quiet in ["", "\n", "switch# "]:
+            with self.subTest(save_output=quiet):
+                connection.reset_mock()
+                connection.send_command.side_effect = [
+                    "checkpoint started",
+                    "checkpoint confirmed",
+                    quiet,
+                ]
+                connection.send_config_set.return_value = "config applied"
+
+                success, _output = self.configurator.configure_aruba_cx(
+                    connection, ["hostname test"]
+                )
+
+                self.assertTrue(success)
+
+    def test_aruba_save_error_fails_without_claiming_auto_revert(self):
+        connection = mock_connection()
+        connection.send_command.side_effect = [
+            "checkpoint started",
+            "checkpoint confirmed",
+            "% Error: unable to write startup configuration",
+        ]
+        connection.send_config_set.return_value = "config applied"
+
+        with patch("switch_configurator.thread_safe_print") as mock_print:
+            success, _output = self.configurator.configure_aruba_cx(
+                connection, ["hostname test"]
+            )
+
+        self.assertFalse(success)
+        messages = " ".join(str(call.args[0]) for call in mock_print.call_args_list)
+        self.assertIn("will NOT auto-revert", messages)
+        self.assertIn("lost on reload", messages)
+        self.assertNotIn("will auto-revert this configuration", messages)
+
+    def test_aruba_save_exception_fails_without_claiming_auto_revert(self):
+        connection = mock_connection()
+        connection.send_command.side_effect = [
+            "checkpoint started",
+            "checkpoint confirmed",
+            OSError("session closed"),
+        ]
+        connection.send_config_set.return_value = "config applied"
+
+        with patch("switch_configurator.thread_safe_print") as mock_print:
+            success, _output = self.configurator.configure_aruba_cx(
+                connection, ["hostname test"]
+            )
+
+        self.assertFalse(success)
+        messages = " ".join(str(call.args[0]) for call in mock_print.call_args_list)
+        self.assertIn("will NOT auto-revert", messages)
+        self.assertNotIn("will auto-revert this configuration", messages)
+
 
 class ConfigModeExitTests(unittest.TestCase):
     def setUp(self):
@@ -969,6 +1058,7 @@ class ConfigModeExitTests(unittest.TestCase):
         connection.send_command.side_effect = [
             "checkpoint started",
             "checkpoint confirmed",
+            "",  # write memory
         ]
         connection.send_config_set.return_value = "config applied"
 
