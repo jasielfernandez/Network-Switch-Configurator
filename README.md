@@ -124,6 +124,18 @@ vlan {mgmt_vlan}
 name Management
 ```
 
+A placeholder is replaced only when it names a column that exists in
+`switches.csv`. Every other brace is sent to the device exactly as written, so
+passwords, RADIUS keys and banner text containing `{` or `}` need no escaping:
+
+```text
+clearpass-password plaintext do~PmB]}password
+```
+
+That line is sent verbatim. A placeholder on the same line as a literal brace
+still resolves normally, and an unrecognized placeholder is left as-is with a
+warning naming it, so a mistyped column shows up before it reaches a switch.
+
 Conditional blocks:
 
 ```text

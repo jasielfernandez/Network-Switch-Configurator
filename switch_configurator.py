@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 import logging
 from pathlib import Path
+import re
 import sys
 import threading
 import time
@@ -101,6 +102,12 @@ SLEEP_TOKEN_PREFIX = "#SLEEP "
 CONFIG_EXIT_ATTEMPTS = 3
 CONFIG_EXIT_SETTLE_SECONDS = 15
 
+# How long the SSH channel must stay silent before the switch is treated as
+# finished talking, and how often it is polled while waiting. This is the whole
+# cost of a drain when there is nothing buffered, so it stays small.
+CHANNEL_QUIET_SECONDS = 1.0
+CHANNEL_POLL_SECONDS = 0.05
+
 # Commands longer than this are sent on their own instead of inside a batch. A
 # switch can spend many seconds decoding and validating a large payload (an NAE
 # script body, for example), and batching it means the remaining commands are
@@ -111,6 +118,13 @@ LARGE_COMMAND_READ_TIMEOUT = 300
 # Operator-facing status lines truncate commands at this length. A multi-kilobyte
 # payload is unreadable in a terminal; the full text still reaches the log file.
 COMMAND_DISPLAY_LIMIT = 120
+
+# Matches a {column} placeholder in commands.txt. A placeholder must start with
+# a letter or underscore; CSV headers here can contain spaces ("ip address"), so
+# spaces are allowed after that. Anything else between braces, and any unpaired
+# brace -- common in passwords and banner text -- does not match and is left
+# exactly as written.
+VARIABLE_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_ .\-]*)\}")
 
 # Common command output errors caught after Netmiko command execution
 ERROR_INDICATORS = (
@@ -832,23 +846,38 @@ class SwitchConfigurator:
         return result
 
     def substitute_variables(self, commands: Sequence[str], switch: Mapping[str, Any]) -> List[str]:
-        """Substitute variables in commands with values from switch CSV row"""
+        """Replace {column} placeholders with values from the switch CSV row.
+
+        Only a placeholder naming a real CSV column is replaced; every other
+        brace is left exactly as written. str.format_map cannot be used here
+        because device configuration legitimately contains braces -- a RADIUS
+        key or a banner, for example. An unpaired brace makes format_map raise
+        for the whole line, which would leave real placeholders on that line
+        unsubstituted and send a literal "{switchname}" to the switch.
+        """
         substituted = []
+
         for cmd in commands:
-            try:
-                # Use format_map for safe variable substitution
-                # This allows {column_name} syntax in commands
-                substituted_cmd = cmd.format_map(switch)
-                substituted.append(substituted_cmd)
-            except KeyError as e:
-                # If a variable is missing, keep the command as-is and warn
-                thread_safe_print(f"WARNING: Variable {str(e)} not found in CSV for command: {str(cmd)}")
-                substituted.append(cmd)
-            except (IndexError, ValueError) as e:
-                # Literal braces (e.g. in banner text) break str.format_map;
-                # send the command unchanged instead of failing the switch.
-                thread_safe_print(f"WARNING: Could not substitute variables ({str(e)}) for command: {str(cmd)}")
-                substituted.append(cmd)
+            unknown: List[str] = []
+
+            def replace(match: "re.Match[str]") -> str:
+                name = match.group(1)
+                if name in switch:
+                    return str(switch[name])
+                unknown.append(name)
+                return match.group(0)
+
+            substituted_cmd = VARIABLE_PATTERN.sub(replace, cmd)
+
+            if unknown:
+                names = ", ".join(sorted(set(unknown)))
+                thread_safe_print(
+                    f"WARNING: Variable(s) {names} not found in CSV; left as-is in command: "
+                    f"{summarize_command(cmd)}"
+                )
+
+            substituted.append(substituted_cmd)
+
         return substituted
 
     def parse_commands_with_conditionals(self, commands: Sequence[str], switch: Mapping[str, Any]) -> List[str]:
@@ -1011,16 +1040,44 @@ class SwitchConfigurator:
         raise last_error
 
     def _drain_channel(self, connection: BaseConnection, context: str) -> None:
-        """Absorb device output still in flight so the next prompt read is current."""
-        try:
-            # Returns once the device has been quiet briefly, or at the timeout,
-            # so a switch still working on the previous command gets to finish.
-            drained = connection.read_channel_timing(read_timeout=CONFIG_EXIT_SETTLE_SECONDS)
-        except Exception as e:
-            logger.debug("Channel drain during %s failed: %s", context, e)
-            return
-        if isinstance(drained, str) and drained.strip():
-            log_device_output(f"Drained channel during {context}", drained)
+        """Absorb device output still in flight so the next prompt read is current.
+
+        Netmiko's read_channel_timing() must not be used here. It only returns
+        normally once it has read at least one byte, so on a channel that is
+        already quiet -- the normal case, because the preceding batch read
+        drained it -- it spins until its absolute timeout and then raises.
+        Worse, a session-level read_timeout_override replaces whatever timeout
+        the caller passes, so that spin lasts as long as the override.
+
+        read_channel() is non-blocking, so polling it keeps this bounded by
+        CONFIG_EXIT_SETTLE_SECONDS regardless of the session's timeouts, and
+        costs only CHANNEL_QUIET_SECONDS when there is nothing to absorb.
+        """
+        deadline = time.monotonic() + CONFIG_EXIT_SETTLE_SECONDS
+        chunks: List[str] = []
+        quiet_since: Optional[float] = None
+
+        while time.monotonic() < deadline:
+            try:
+                chunk = cast(str, connection.read_channel())
+            except Exception as e:
+                logger.debug("Channel drain during %s stopped: %s", context, e)
+                break
+
+            if chunk:
+                chunks.append(chunk)
+                quiet_since = None
+                continue
+
+            now = time.monotonic()
+            if quiet_since is None:
+                quiet_since = now
+            elif now - quiet_since >= CHANNEL_QUIET_SECONDS:
+                break
+            time.sleep(CHANNEL_POLL_SECONDS)
+
+        if chunks:
+            log_device_output(f"Drained channel during {context}", "".join(chunks))
 
     def _exit_config_mode_safely(self, connection: BaseConnection) -> None:
         """Leave configuration mode, tolerating a backlog of buffered device output.
