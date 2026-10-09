@@ -48,9 +48,24 @@ The configurator uses:
 checkpoint auto <minutes>
 ...
 checkpoint auto confirm
+write memory
 ```
 
 HPE documents `checkpoint auto <TIME-LAPSE-INTERVAL>` as a 1-60 minute temporary checkpoint. If `checkpoint auto confirm` is not entered within the interval, the runtime configuration is restored from the temporary checkpoint.
+
+Confirming the checkpoint only cancels that pending revert — it leaves the change in the
+running configuration, which a reload would discard. `write memory` is therefore sent
+afterwards to persist it, and the order matters: saving *before* the confirm would write a
+change to the startup configuration that a later revert would undo in the running
+configuration only, so a reload would restore the very change the rollback removed.
+
+Do not put `write memory` (or `wr`) in `commands.txt`. Commands from that file run inside
+configuration mode, before the confirm, which is the unsafe order described above.
+
+AOS-CX has no documented success banner for `write memory`, so the save is treated as
+successful unless the device reports an explicit error. If the save does fail, that switch
+is reported as failed and the run says plainly that the configuration is applied and
+confirmed — it will not auto-revert — but was not persisted.
 
 Source: HPE Aruba AOS-CX command reference for `checkpoint auto`:
 https://support.hpe.com/hpesc/public/docDisplay?docId=sd00007458en_us&docLocale=en_US&page=GUID-A18F399E-3CDE-4727-9801-5C62AB5FF791.html

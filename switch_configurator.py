@@ -614,7 +614,36 @@ class SwitchConfigurator:
                 thread_safe_print(f"HINT: {error_hint}")
                 return False, output
 
-            thread_safe_print("SUCCESS: Auto checkpoint confirmed - configuration saved permanently!")
+            thread_safe_print("SUCCESS: Auto checkpoint confirmed - configuration will not auto-revert")
+
+            # Confirming the checkpoint only cancels the pending revert; the change
+            # is still in the running configuration alone and AOS-CX needs an
+            # explicit save to survive a reload. The save has to come after the
+            # confirm: writing startup-config first would persist a change that a
+            # later revert would undo in running-config only, so a reload would
+            # bring back the configuration the rollback was supposed to remove.
+            thread_safe_print("INFO: Saving configuration to startup-config...")
+            try:
+                save_output: str = cast(str, connection.send_command('write memory',
+                                                                     read_timeout=120,
+                                                                     expect_string=r'.*#'))
+                output += save_output + "\n"
+                log_device_output("Aruba write memory", save_output)
+            except Exception as e:
+                thread_safe_print(f"ERROR: Failed to execute write memory: {str(e)}")
+                thread_safe_print(self._aruba_unsaved_warning())
+                return False, output + f"\nERROR: {str(e)}"
+
+            # Only an explicit device error counts as failure here. Unlike Cisco,
+            # AOS-CX has no documented success banner for 'write memory', so a
+            # quiet reply is normal and must not be read as a failed save.
+            save_error = find_error_line(save_output)
+            if save_error:
+                thread_safe_print(f"ERROR: Failed to save configuration: {save_error}")
+                thread_safe_print(self._aruba_unsaved_warning())
+                return False, output
+
+            thread_safe_print("SUCCESS: Configuration confirmed and saved to startup-config!")
             return True, output
 
         except Exception as e:
@@ -624,6 +653,19 @@ class SwitchConfigurator:
                 f"this configuration within {self.rollback_timer} minutes"
             )
             return False, output + f"\nERROR: {str(e)}"
+
+    @staticmethod
+    def _aruba_unsaved_warning() -> str:
+        """Warning for a confirmed-but-unsaved Aruba configuration.
+
+        The distinction matters to an operator: the checkpoint is already
+        confirmed, so nothing reverts, but the change exists only in the running
+        configuration and a reload discards it.
+        """
+        return (
+            "WARNING: The configuration is applied and confirmed, so it will NOT auto-revert, "
+            "but it was not saved and will be lost on reload. Run 'write memory' on the switch."
+        )
 
     def configure_cisco_ios_xe(self, connection: BaseConnection, commands: List[str]) -> Tuple[bool, str]:
         """Configure Cisco IOS XE switch with configure terminal revert"""
