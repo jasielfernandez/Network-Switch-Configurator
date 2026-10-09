@@ -102,6 +102,12 @@ SLEEP_TOKEN_PREFIX = "#SLEEP "
 CONFIG_EXIT_ATTEMPTS = 3
 CONFIG_EXIT_SETTLE_SECONDS = 15
 
+# How long the SSH channel must stay silent before the switch is treated as
+# finished talking, and how often it is polled while waiting. This is the whole
+# cost of a drain when there is nothing buffered, so it stays small.
+CHANNEL_QUIET_SECONDS = 1.0
+CHANNEL_POLL_SECONDS = 0.05
+
 # Commands longer than this are sent on their own instead of inside a batch. A
 # switch can spend many seconds decoding and validating a large payload (an NAE
 # script body, for example), and batching it means the remaining commands are
@@ -1034,16 +1040,44 @@ class SwitchConfigurator:
         raise last_error
 
     def _drain_channel(self, connection: BaseConnection, context: str) -> None:
-        """Absorb device output still in flight so the next prompt read is current."""
-        try:
-            # Returns once the device has been quiet briefly, or at the timeout,
-            # so a switch still working on the previous command gets to finish.
-            drained = connection.read_channel_timing(read_timeout=CONFIG_EXIT_SETTLE_SECONDS)
-        except Exception as e:
-            logger.debug("Channel drain during %s failed: %s", context, e)
-            return
-        if isinstance(drained, str) and drained.strip():
-            log_device_output(f"Drained channel during {context}", drained)
+        """Absorb device output still in flight so the next prompt read is current.
+
+        Netmiko's read_channel_timing() must not be used here. It only returns
+        normally once it has read at least one byte, so on a channel that is
+        already quiet -- the normal case, because the preceding batch read
+        drained it -- it spins until its absolute timeout and then raises.
+        Worse, a session-level read_timeout_override replaces whatever timeout
+        the caller passes, so that spin lasts as long as the override.
+
+        read_channel() is non-blocking, so polling it keeps this bounded by
+        CONFIG_EXIT_SETTLE_SECONDS regardless of the session's timeouts, and
+        costs only CHANNEL_QUIET_SECONDS when there is nothing to absorb.
+        """
+        deadline = time.monotonic() + CONFIG_EXIT_SETTLE_SECONDS
+        chunks: List[str] = []
+        quiet_since: Optional[float] = None
+
+        while time.monotonic() < deadline:
+            try:
+                chunk = cast(str, connection.read_channel())
+            except Exception as e:
+                logger.debug("Channel drain during %s stopped: %s", context, e)
+                break
+
+            if chunk:
+                chunks.append(chunk)
+                quiet_since = None
+                continue
+
+            now = time.monotonic()
+            if quiet_since is None:
+                quiet_since = now
+            elif now - quiet_since >= CHANNEL_QUIET_SECONDS:
+                break
+            time.sleep(CHANNEL_POLL_SECONDS)
+
+        if chunks:
+            log_device_output(f"Drained channel during {context}", "".join(chunks))
 
     def _exit_config_mode_safely(self, connection: BaseConnection) -> None:
         """Leave configuration mode, tolerating a backlog of buffered device output.

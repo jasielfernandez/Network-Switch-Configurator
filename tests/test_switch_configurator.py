@@ -1,5 +1,6 @@
 import unittest
 import logging
+import time
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -8,7 +9,9 @@ from unittest.mock import MagicMock, patch
 from netmiko import NetmikoAuthenticationException, NetmikoTimeoutException
 
 from switch_configurator import (
+    CHANNEL_QUIET_SECONDS,
     CONFIG_EXIT_ATTEMPTS,
+    CONFIG_EXIT_SETTLE_SECONDS,
     CONNECT_ATTEMPTS,
     CONNECT_RETRY_DELAY,
     LARGE_COMMAND_READ_TIMEOUT,
@@ -24,6 +27,18 @@ from switch_configurator import (
     logger,
     summarize_command,
 )
+
+
+def mock_connection():
+    """A mock SSH connection whose channel reads as already drained.
+
+    read_channel() returning "" is what a real, idle channel does; a bare
+    MagicMock returns a truthy object forever, which would make the buffer
+    drain wait out its full settle window.
+    """
+    connection = MagicMock()
+    connection.read_channel.return_value = ""
+    return connection
 
 
 class ExecuteConfigurationCommandsTests(unittest.TestCase):
@@ -807,9 +822,12 @@ class LoaderTests(unittest.TestCase):
 class VendorFlowTests(unittest.TestCase):
     def setUp(self):
         self.configurator = SwitchConfigurator("user", "pass")
+        patcher = patch("switch_configurator.CHANNEL_QUIET_SECONDS", 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_cisco_archive_already_configured_success_path(self):
-        connection = MagicMock()
+        connection = mock_connection()
         connection.send_command.side_effect = [
             "Archive path: flash:/archive",
             "configure terminal revert timer 2",
@@ -825,7 +843,7 @@ class VendorFlowTests(unittest.TestCase):
         connection.exit_config_mode.assert_called_once()
 
     def test_cisco_archive_auto_setup_uses_config_mode_batch(self):
-        connection = MagicMock()
+        connection = mock_connection()
         connection.send_command.side_effect = [
             "No archive configured",
             "Building configuration...\n[OK]",
@@ -855,7 +873,7 @@ class VendorFlowTests(unittest.TestCase):
         )
 
     def test_cisco_save_failure_returns_false(self):
-        connection = MagicMock()
+        connection = mock_connection()
         connection.send_command.side_effect = [
             "Archive path: flash:/archive",
             "configure terminal revert timer 2",
@@ -869,7 +887,7 @@ class VendorFlowTests(unittest.TestCase):
         self.assertFalse(success)
 
     def test_aruba_confirm_failure_returns_false(self):
-        connection = MagicMock()
+        connection = mock_connection()
         connection.send_command.side_effect = [
             "checkpoint started",
             "% Invalid input detected",
@@ -885,19 +903,24 @@ class VendorFlowTests(unittest.TestCase):
 class ConfigModeExitTests(unittest.TestCase):
     def setUp(self):
         self.configurator = SwitchConfigurator("user", "pass")
+        # The real quiet period is a wall-clock wait; shorten it for the tests
+        # that only care about control flow. test_drain_is_bounded_* cover timing.
+        patcher = patch("switch_configurator.CHANNEL_QUIET_SECONDS", 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_exit_drains_channel_before_reading_the_prompt(self):
-        connection = MagicMock()
-        connection.read_channel_timing.return_value = "sw(config)# "
+        connection = mock_connection()
+        connection.read_channel.side_effect = ["sw(config)# ", "", ""]
 
         self.configurator._exit_config_mode_safely(connection)
 
-        connection.read_channel_timing.assert_called_once()
+        self.assertTrue(connection.read_channel.called)
         connection.exit_config_mode.assert_called_once_with()
 
     def test_exit_retries_after_a_stale_prompt_read(self):
-        connection = MagicMock()
-        connection.read_channel_timing.return_value = ""
+        connection = mock_connection()
+        connection.read_channel.return_value = ""
         connection.exit_config_mode.side_effect = [
             ValueError("Failed to exit configuration mode"),
             None,
@@ -906,12 +929,10 @@ class ConfigModeExitTests(unittest.TestCase):
         self.configurator._exit_config_mode_safely(connection)
 
         self.assertEqual(connection.exit_config_mode.call_count, 2)
-        # The channel is drained again before the retry reads the prompt.
-        self.assertEqual(connection.read_channel_timing.call_count, 2)
 
     def test_exit_raises_device_execution_error_after_max_attempts(self):
-        connection = MagicMock()
-        connection.read_channel_timing.return_value = ""
+        connection = mock_connection()
+        connection.read_channel.return_value = ""
         connection.exit_config_mode.side_effect = ValueError("Failed to exit configuration mode")
 
         with self.assertRaises(DeviceExecutionError):
@@ -920,17 +941,27 @@ class ConfigModeExitTests(unittest.TestCase):
         self.assertEqual(connection.exit_config_mode.call_count, CONFIG_EXIT_ATTEMPTS)
 
     def test_drain_failure_does_not_prevent_the_exit(self):
-        connection = MagicMock()
-        connection.read_channel_timing.side_effect = OSError("socket not ready")
+        connection = mock_connection()
+        connection.read_channel.side_effect = OSError("socket not ready")
 
         self.configurator._exit_config_mode_safely(connection)
 
         connection.exit_config_mode.assert_called_once_with()
 
+    def test_drain_never_calls_read_channel_timing(self):
+        """read_channel_timing only returns after reading a byte, so a quiet
+        channel makes it spin to its absolute timeout and raise."""
+        connection = mock_connection()
+        connection.read_channel.return_value = ""
+
+        self.configurator._exit_config_mode_safely(connection)
+
+        connection.read_channel_timing.assert_not_called()
+
     def test_aruba_confirms_checkpoint_after_a_transient_exit_failure(self):
         """A stale prompt read must not cost the switch its applied configuration."""
-        connection = MagicMock()
-        connection.read_channel_timing.return_value = ""
+        connection = mock_connection()
+        connection.read_channel.return_value = ""
         connection.exit_config_mode.side_effect = [
             ValueError("Failed to exit configuration mode"),
             None,
@@ -949,13 +980,55 @@ class ConfigModeExitTests(unittest.TestCase):
         )
 
 
+class DrainBoundTests(unittest.TestCase):
+    """Timing of the drain itself, with the real CHANNEL_QUIET_SECONDS."""
+
+    def setUp(self):
+        self.configurator = SwitchConfigurator("user", "pass")
+
+    def test_drain_is_bounded_on_an_already_quiet_channel(self):
+        connection = mock_connection()
+        connection.read_channel.return_value = ""
+
+        start = time.monotonic()
+        self.configurator._drain_channel(connection, "test")
+        elapsed = time.monotonic() - start
+
+        # Must cost about CHANNEL_QUIET_SECONDS, never CONFIG_EXIT_SETTLE_SECONDS
+        # and never a session read_timeout_override.
+        self.assertLess(elapsed, CONFIG_EXIT_SETTLE_SECONDS / 2)
+
+    def test_drain_is_bounded_when_the_channel_never_goes_quiet(self):
+        connection = mock_connection()
+        connection.read_channel.return_value = "noise"
+
+        with patch("switch_configurator.CONFIG_EXIT_SETTLE_SECONDS", 0.5):
+            start = time.monotonic()
+            self.configurator._drain_channel(connection, "test")
+            elapsed = time.monotonic() - start
+
+        self.assertLess(elapsed, 3)
+
+    def test_drain_logs_what_it_absorbed(self):
+        connection = mock_connection()
+        connection.read_channel.side_effect = ["sw(config)# ", "sw(config)# ", "", ""]
+
+        with patch("switch_configurator.CHANNEL_QUIET_SECONDS", 0):
+            with patch("switch_configurator.logger.debug") as mock_debug:
+                self.configurator._drain_channel(connection, "test")
+
+        mock_debug.assert_any_call(
+            "%s output:\n%s", "Drained channel during test", "sw(config)# sw(config)#"
+        )
+
+
 class LargeCommandTests(unittest.TestCase):
     def setUp(self):
         self.configurator = SwitchConfigurator("user", "pass")
         self.large_command = "nae-script idle_port_reclaim false " + ("A" * LARGE_COMMAND_THRESHOLD)
 
     def test_large_command_is_sent_alone_and_waits_for_the_prompt(self):
-        connection = MagicMock()
+        connection = mock_connection()
         connection.send_command.return_value = "script installed"
 
         output = self.configurator.execute_configuration_commands(
@@ -976,7 +1049,7 @@ class LargeCommandTests(unittest.TestCase):
         connection.send_config_set.assert_not_called()
 
     def test_large_command_flushes_the_pending_batch_first(self):
-        connection = MagicMock()
+        connection = mock_connection()
         connection.send_config_set.side_effect = ["vlan applied", "trailing applied"]
         connection.send_command.return_value = "script installed"
 
@@ -994,7 +1067,7 @@ class LargeCommandTests(unittest.TestCase):
         )
 
     def test_large_command_enters_config_mode_when_needed(self):
-        connection = MagicMock()
+        connection = mock_connection()
         connection.send_command.return_value = "script installed"
 
         self.configurator.execute_configuration_commands(
@@ -1009,7 +1082,7 @@ class LargeCommandTests(unittest.TestCase):
         """Prompt keywords match anywhere in a command, including inside a payload."""
         self.configurator.prompt_handlers = {"delete": "yes\n"}
         payload = "nae-script demo false " + ("delete" * 400)
-        connection = MagicMock()
+        connection = mock_connection()
         connection.send_command.return_value = "script installed"
 
         self.configurator.execute_configuration_commands(
@@ -1021,7 +1094,7 @@ class LargeCommandTests(unittest.TestCase):
         connection.send_command_timing.assert_not_called()
 
     def test_large_command_error_output_raises(self):
-        connection = MagicMock()
+        connection = mock_connection()
         connection.send_command.return_value = "% Invalid input detected"
 
         with self.assertRaises(DeviceExecutionError):
@@ -1048,7 +1121,7 @@ class ConnectionRetryTests(unittest.TestCase):
     @patch("switch_configurator.time.sleep")
     @patch("switch_configurator.ConnectHandler")
     def test_auth_failure_retries_after_delay_then_succeeds(self, mock_connect, mock_sleep):
-        connection = MagicMock()
+        connection = mock_connection()
         mock_connect.side_effect = [
             NetmikoAuthenticationException("auth failed"),
             connection,
@@ -1063,7 +1136,7 @@ class ConnectionRetryTests(unittest.TestCase):
     @patch("switch_configurator.time.sleep")
     @patch("switch_configurator.ConnectHandler")
     def test_timeout_retries_after_delay_then_succeeds(self, mock_connect, mock_sleep):
-        connection = MagicMock()
+        connection = mock_connection()
         mock_connect.side_effect = [
             NetmikoTimeoutException("timed out"),
             connection,
@@ -1088,7 +1161,7 @@ class ConnectionRetryTests(unittest.TestCase):
     @patch("switch_configurator.time.sleep")
     @patch("switch_configurator.ConnectHandler")
     def test_first_attempt_success_does_not_sleep(self, mock_connect, mock_sleep):
-        connection = MagicMock()
+        connection = mock_connection()
         mock_connect.return_value = connection
 
         result = self.configurator._connect_with_retries(self.device, "sw1")
